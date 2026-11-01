@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+layout(constant_id=3) const bool COMMIT=false;
+shared float sums[8],normalized[128];
+void main(){uint task=gl_WorkGroupID.x,batch=COMMIT?task/64:0;task=COMMIT?task%64:task;
+ uint row=task/8,h=task%8,i=gl_LocalInvocationIndex;
+ uint count=COMMIT?min(8,RU32(binding_address(12)).values[batch]):RU32(binding_address(6)).values[0];
+ uint start=COMMIT?RU32(binding_address(13)).values[batch]:RU32(binding_address(6)).values[1];if(row>=count)return;
+ uint slot=(start+row)%2048,src=(batch*8+row)*2048+h*128;
+ if(!COMMIT)src=row*2048+h*128;
+ float v=i<128?rb(binding_address(0),src+i):0,s=subgroupAdd(v*v);if(gl_SubgroupInvocationID==0)sums[gl_SubgroupID]=s;barrier();
+ if(i==0){float sum=0;for(uint j=0;j<8;++j)sum+=sums[j];sums[0]=inversesqrt(sum/128.0+1e-6);}barrier();
+ uint64_t keys=binding_address(COMMIT?4+batch:4),values=binding_address(COMMIT?8+batch:5);
+ if(i<128){normalized[i]=bf16_float(float_bf16(v*sums[0]*rb(binding_address(1),i)));wb(values,(h*128+i)*2048+slot,rb(binding_address(0),src+1024+i));}barrier();
+ if(i<64){float a=normalized[i],b=normalized[i+64],c=RF32(binding_address(2)).values[(batch*8+row)*64+i],sine=RF32(binding_address(3)).values[(batch*8+row)*64+i];uint dst=(h*2048+slot)*128;wb(keys,dst+i,a*c-b*sine);wb(keys,dst+i+64,b*c+a*sine);}
+}

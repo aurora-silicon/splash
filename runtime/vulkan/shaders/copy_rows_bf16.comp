@@ -1,0 +1,41 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(set = 0, binding = 0, std430) readonly buffer DispatchTable {
+    uint64_t addresses[];
+} dispatch_table;
+layout(push_constant) uniform DispatchIndex { uint address_index; } dispatch_index;
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer Input {
+    uint16_t values[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 2) writeonly buffer Output {
+    uint16_t values[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Params {
+    uint rows;
+    uint width;
+    uint source_row;
+    uint source_stride;
+    uint source_column;
+    uint destination_row;
+    uint destination_stride;
+    uint destination_column;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    Input source = Input(dispatch_table.addresses[dispatch_index.address_index]);
+    Output destination = Output(dispatch_table.addresses[dispatch_index.address_index + 1]);
+    Params p = Params(dispatch_table.addresses[dispatch_index.address_index + 2]);
+    if (i >= p.rows * p.width) return;
+    uint row = i / p.width;
+    uint column = i % p.width;
+    uint64_t destination_offset = (uint64_t(p.destination_row + row) * p.destination_stride + p.destination_column + column) * 2;
+    uint64_t source_offset = (uint64_t(p.source_row + row) * p.source_stride + p.source_column + column) * 2;
+    Output(uint64_t(destination) + destination_offset).values[0] =
+        Input(uint64_t(source) + source_offset).values[0];
+}

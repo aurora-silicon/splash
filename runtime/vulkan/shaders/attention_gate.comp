@@ -1,0 +1,9 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "attention_common.glsl"
+void main(){uint i=gl_GlobalInvocationID.x,n=RU32(binding_address(3)).values[0],rows=VERIFY?8:n,stride=VERIFY?32:RU32(binding_address(3)).values[1],lanes=VERIFY?n:1;
+ if(i>=lanes*rows*QH*256)return;uint batch=i/(rows*QH*256),element=i%(rows*QH*256),row=element/(QH*256),head=(element/256)%QH,dim=i%256;
+ float gate=rb(binding_address(0),(batch*rows+row)*(2*QH+2*KH)*256+head*512+256+dim);
+ uint ai=(((batch*KH+head/(QH/KH))*stride+row)*(QH/KH)+head%(QH/KH))*256+dim;
+ wb(binding_address(2),i,rb(binding_address(1),ai)/(1.0+exp(-gate)));}

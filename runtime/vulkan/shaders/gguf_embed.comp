@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "quant.glsl"
+#include "native_quant.glsl"
+layout(constant_id=3) const uint FORMAT=4;
+layout(constant_id=4) const bool OUT_F32=false;
+layout(buffer_reference,std430,buffer_reference_align=4) readonly buffer Params { uint rows; uint vocabulary; uint hidden; };
+void main() {
+    Params p=Params(binding_address(3));
+    uint i=gl_GlobalInvocationID.x;
+    if(i>=p.rows*p.hidden) return;
+    uint token=RU32(binding_address(0)).values[i/p.hidden];
+    if(token>=p.vocabulary) token=0;
+    float v=native_value(FORMAT,binding_address(1),token,i%p.hidden,p.hidden);
+    if(OUT_F32) WF32(binding_address(2)).values[i]=v;
+    else W16(binding_address(2)).values[i]=float_bf16(v);
+}

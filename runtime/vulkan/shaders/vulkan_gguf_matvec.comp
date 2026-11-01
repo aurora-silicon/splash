@@ -1,0 +1,163 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "common.glsl"
+#include "quant.glsl"
+
+layout(constant_id = 3) const uint FORMAT0 = 0;
+layout(constant_id = 4) const uint FORMAT1 = 0;
+layout(constant_id = 5) const uint FORMAT2 = 0;
+layout(constant_id = 6) const uint EPILOGUE = 0;
+layout(constant_id = 7) const bool OUTPUT_F32 = false;
+layout(constant_id = 8) const uint INPUT_WIDTH = 0;
+layout(constant_id = 9) const uint PLANE_WIDTH = 0;
+layout(constant_id = 10) const uint OUTPUT_WIDTH = 0;
+layout(constant_id = 11) const bool FULL_ROWS = false;
+layout(constant_id = 12) const uint SEGMENTS = 1;
+layout(constant_id = 13) const bool FULL_COLUMNS = false;
+layout(constant_id=14) const bool ALIGNED_INPUT=true;
+layout(constant_id=15) const uint K_SPLITS=1;
+layout(constant_id=16) const bool SHARED_ACCUMULATORS=false;
+layout(constant_id=17)const bool FOUR_CHAINS=false;
+layout(constant_id=18)const uint ACTIVE_ROWS=8;
+layout(constant_id=19)const bool INPUT_F32=false;
+shared float partial_sums[64];
+shared float accumulator_cache[2048];
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Params {
+    uint rows;
+    uint input_size;
+    uint out_stride;
+    uint plane_input_size;
+    uint cols[3];
+    uint fmt[3];
+    uint offset[3];
+    uint epilogue;
+    uint output_f32;
+    uint row_start;
+    uint active_rows;
+    uint input_f32;
+};
+float weight_at(uint segment, uint row, uint column) {
+    if (SEGMENTS == 1 || segment == 0) return q_value(FORMAT0, binding_address(1), binding_address(2), binding_address(3), row, column, PLANE_WIDTH);
+    if (segment == 1) return q_value(FORMAT1, binding_address(4), binding_address(5), binding_address(6), row, column, PLANE_WIDTH);
+    return q_value(FORMAT2, binding_address(7), binding_address(8), binding_address(9), row, column, PLANE_WIDTH);
+}
+
+
+// Consume adjacent BF16 pairs with dword loads and keep only one token
+// row's input live. Rotating accumulators avoids a dynamically indexed
+// register array while retaining one decode of each eight-weight word.
+void accumulate_eight(inout float sums[8],float weights[8],uint k0,uint k1,uint base,uint row_start,uint rows){
+ uint64_t a0=binding_address(0)+(INPUT_F32?4:2)*(uint64_t(base+row_start)*INPUT_WIDTH+k0);
+ uint64_t a1=binding_address(0)+(INPUT_F32?4:2)*(uint64_t(base+row_start)*INPUT_WIDTH+k1);
+ [[dont_unroll]] for(uint row=0;row<ACTIVE_ROWS;++row){
+  float value=SHARED_ACCUMULATORS?accumulator_cache[row*256+gl_LocalInvocationIndex]:sums[0];
+  if(FULL_ROWS||base+row<rows){
+   if(ALIGNED_INPUT){
+    vec4 low,high;
+    if(INPUT_F32){low=RF32x4(a0).values[0];high=RF32x4(a1).values[0];}
+    else{uvec2 v0=RU32x2(a0).values[0],v1=RU32x2(a1).values[0];uint x0=v0.x,x1=v0.y,x2=v1.x,x3=v1.y;
+     low=vec4(uintBitsToFloat(x0<<16),uintBitsToFloat(x0&0xffff0000u),uintBitsToFloat(x1<<16),uintBitsToFloat(x1&0xffff0000u));
+     high=vec4(uintBitsToFloat(x2<<16),uintBitsToFloat(x2&0xffff0000u),uintBitsToFloat(x3<<16),uintBitsToFloat(x3&0xffff0000u));}
+    if(FOUR_CHAINS){
+      vec4 partial=low*vec4(weights[0],weights[1],weights[2],weights[3]);
+      partial=fma(high,vec4(weights[4],weights[5],weights[6],weights[7]),partial);
+      value+=(partial.x+partial.y)+(partial.z+partial.w);
+    }else{
+      [[unroll]]for(uint i=0;i<4;++i)value=fma(low[i],weights[i],value);
+      [[unroll]]for(uint i=0;i<4;++i)value=fma(high[i],weights[4+i],value);
+    }
+   }else{
+    [[unroll]] for(uint j=0;j<4;++j)value=fma(bf16_float(R16(a0+2*j).values[0]),weights[j],value);
+    [[unroll]] for(uint j=0;j<4;++j)value=fma(bf16_float(R16(a1+2*j).values[0]),weights[4+j],value);
+   }
+  }
+  if(SHARED_ACCUMULATORS)accumulator_cache[row*256+gl_LocalInvocationIndex]=value;
+  else{[[unroll]] for(uint j=0;j<7;++j)sums[j]=sums[j+1];sums[7]=value;}
+  a0+=(INPUT_F32?4:2)*INPUT_WIDTH;a1+=(INPUT_F32?4:2)*INPUT_WIDTH;
+ }
+ if(!SHARED_ACCUMULATORS)for(uint unused=ACTIVE_ROWS;unused<8;++unused){float v=sums[0];[[unroll]]for(uint j=0;j<7;++j)sums[j]=sums[j+1];sums[7]=v;}
+}
+
+// One subgroup owns one output column. Its 32 lanes share the K dimension
+// and reuse every decoded weight across all eight verification rows.
+void main() {
+ Params p=Params(binding_address(12));
+ uint cpg=8/K_SPLITS;
+ uint tile=gl_WorkGroupID.x,t0=(p.cols[0]+cpg-1)/cpg,t1=t0+(p.cols[1]+cpg-1)/cpg;
+ uint segment=SEGMENTS==1?0:tile<t0?0:tile<t1?1:2;
+ uint column=(tile-(segment==0?0:segment==1?t0:t1))*cpg+gl_SubgroupID/K_SPLITS;
+ uint ksplit=gl_SubgroupID%K_SPLITS;
+ bool validColumn=column<p.cols[segment];
+ uint lane=gl_SubgroupInvocationID,base=gl_WorkGroupID.y*8;
+ float sums[8];for(uint row=0;row<8;++row){sums[row]=0;if(SHARED_ACCUMULATORS)accumulator_cache[row*256+gl_LocalInvocationIndex]=0;}
+
+ uint f=segment==0?FORMAT0:segment==1?FORMAT1:FORMAT2;
+ uint64_t weights0=binding_address(1+3*segment),weights1=binding_address(2+3*segment),metadata=binding_address(3+3*segment);
+ bool packed=(f==0||f==1||f==2||f==3||f==4||(q_affine(f)&&q_bits(f)==4));
+ if(validColumn&&INPUT_WIDTH%256==0&&packed){
+  // Each lane reads one packed word (eight weights). The subgroup covers
+  // 256 input columns per iteration; scale/minimum loads are shared by all
+  // eight codes instead of repeated for every scalar weight.
+  uint group=lane/4,word=lane%4;
+  uint groups=PLANE_WIDTH/32,mg=q_meta_groups(f);uvec3 fields=q_fields(f);
+  for(uint begin=ksplit*256;begin<INPUT_WIDTH;begin+=K_SPLITS*256){
+   uint g=begin/32+group,j=g%mg;
+   uint64_t a0=weights0+q_tile(column,g,groups)*fields.x;
+   uint64_t a1=weights1+q_tile(column,g,groups)*fields.y;
+   uint64_t meta=metadata+q_tile(column,g/mg,groups/mg)*fields.z;
+   uint low=RU32(a0+4*word).values[0],high=0;
+   if(f==4)high=RU32(a1+4*(word/2)).values[0];
+   else if(f==3)high=RU32(a1).values[0];
+   float scale0=0,scale1=0,bias=0;
+   if(f==4){uint scales=uint(R16(meta+2*j).values[0]);float d=q_half(meta+16);scale0=d*float(q_signed(scales&255));scale1=d*float(q_signed(scales>>8));}
+   else if(f==1||f==2){scale0=q_half(meta);if(f==1){uint lo=(q_byte(meta,4+j/2)>>(4*(j&1)))&15,hi=(uint(R16(meta+2).values[0])>>(2*j))&3;scale0*=float(int(lo|(hi<<4))-32);}scale1=scale0;}
+   else if(q_affine(f)){scale0=bf16_float(R16(meta).values[0]);scale1=scale0;bias=bf16_float(R16(meta+2).values[0]);}
+   else{uint sc,mi;if(j<4){sc=q_byte(meta,4+j)&63;mi=q_byte(meta,8+j)&63;}else{sc=(q_byte(meta,8+j)&15)|((q_byte(meta,j)>>6)<<4);mi=(q_byte(meta,8+j)>>4)|((q_byte(meta,4+j)>>6)<<4);}scale0=q_half(meta)*float(sc);scale1=scale0;bias=-q_half(meta+2)*float(mi);}
+   float decoded[8];
+   [[unroll]] for(uint pair=0;pair<4;++pair){
+    [[unroll]] for(uint parity=0;parity<2;++parity){
+     uint e=4*word+16*(pair/2)+2*(pair%2)+parity;
+     uint slot=8*word+2*pair+parity;
+     uint code=(low>>((f==1||f==2)?8*pair+4*parity:4*pair+16*parity))&15;
+     if(f==4)code|=((high>>(2*(slot%16)))&3)<<4;
+     else if(f==3)code|=((high>>slot)&1)<<4;
+     decoded[2*pair+parity]=(f==1||f==2)?scale0*q_iq4(code):f==4?(e<16?scale0:scale1)*float(int(code)-32):fma(scale0,float(code),bias);
+    }
+   }
+   uint k0=begin+group*32+4*word;
+   accumulate_eight(sums,decoded,k0,k0+16,base,p.row_start,p.rows);
+  }
+ }else if(validColumn&&INPUT_WIDTH%256==0&&f==6){
+  uint group=lane/8,word=lane%8,groups=PLANE_WIDTH/32;
+  for(uint begin=ksplit*256;begin<INPUT_WIDTH;begin+=K_SPLITS*256){
+   float decoded[8];
+   [[unroll]] for(uint half_block=0;half_block<2;++half_block){
+    uint g=begin/32+group+4*half_block;uint64_t ti=q_tile(column,g,groups);
+    uint packedWord=RU32(weights0+ti*32+word*4).values[0];float scale=q_half(metadata+ti*2);
+    [[unroll]] for(uint elem=0;elem<4;++elem)decoded[4*half_block+elem]=scale*float(q_signed((packedWord>>(8*elem))&255));
+   }
+   uint slot=word*4,chunk=slot/8,pair=(slot/2)%4,e=4*chunk+16*(pair/2)+2*(pair%2)+slot%2;
+   uint k0=begin+group*32+e;
+   accumulate_eight(sums,decoded,k0,k0+128,base,p.row_start,p.rows);
+  }
+ }else if(validColumn){
+  for(uint k=lane+ksplit*32;k<INPUT_WIDTH;k+=K_SPLITS*32){float weight=weight_at(segment,column,k);
+   [[unroll]] for(uint row=0;row<8;++row){float x=0;if(row<ACTIVE_ROWS&&(FULL_ROWS||base+row<p.rows))x=INPUT_F32?RF32(binding_address(0)+4*(uint64_t(base+row+p.row_start)*INPUT_WIDTH+k)).values[0]:bf16_float(R16(binding_address(0)+2*(uint64_t(base+row+p.row_start)*INPUT_WIDTH+k)).values[0]);sums[row]=fma(x,weight,sums[row]);}
+  }
+ }
+ if(SHARED_ACCUMULATORS&&!(INPUT_WIDTH%256==0&&(packed||f==6)))for(uint row=0;row<8;++row)accumulator_cache[row*256+gl_LocalInvocationIndex]=sums[row];
+ [[unroll]] for(uint row=0;row<8;++row){float v=subgroupAdd(SHARED_ACCUMULATORS?accumulator_cache[row*256+gl_LocalInvocationIndex]:sums[row]);if(lane==0)partial_sums[gl_SubgroupID*8+row]=v;}
+ barrier();
+ if(ksplit==0&&lane<8&&validColumn&&(FULL_ROWS||base+lane<p.rows)){
+  uint row=lane;float value=0;
+  [[unroll]] for(uint part=0;part<K_SPLITS;++part)value+=partial_sums[(gl_SubgroupID+part)*8+row];
+  uint64_t index=uint64_t(base+row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+column;
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if(row>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;
+  else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}

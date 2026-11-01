@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+
+shared float values[8];shared uint indices[8];
+void main(){RU32 p=RU32(binding_address(4));uint group=gl_WorkGroupID.x,s=group/16,shard=group%16,rows=p.values[2],b=s/rows,index=s%rows,thread=gl_LocalInvocationIndex,lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;
+ if((p.values[23]&(1u<<b))!=0)return;uint vocab=p.values[0];float best=-1.0/0.0;uint id=0xffffffffu;
+ for(uint tok=shard*256+thread;tok<vocab;tok+=4096){if((p.values[24]&(1u<<b))!=0){uint mi=((b*9+p.values[4]+index)*p.values[1])+tok/32;if((RU32(binding_address(1)).values[mi]&(1u<<(tok%32)))==0)continue;}
+ if((p.values[25]&(1u<<b))!=0&&(tok==p.values[26]||tok==p.values[27]))continue;
+ float v=RF32(binding_address(0)).values[(b*8+p.values[3]+index)*vocab+tok];if(isnan(v)||(isinf(v)&&v<0))continue;if(v>best||(v==best&&tok<id)){best=v;id=tok;}}
+ float m=subgroupMax(best);uint mini=subgroupMin(best==m?id:0xffffffffu);if(lane==0){values[sg]=m;indices[sg]=mini;}barrier();
+ float v=lane<8?values[lane]:-1.0/0.0;m=subgroupMax(v);mini=subgroupMin(lane<8&&v==m?indices[lane]:0xffffffffu);
+ if(thread==0){WF32(binding_address(2)).values[group]=m;WU32(binding_address(3)).values[group]=mini;}
+}

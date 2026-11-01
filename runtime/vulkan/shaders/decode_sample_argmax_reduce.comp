@@ -1,0 +1,7 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+
+void main(){RU32 p=RU32(binding_address(3));uint s=gl_WorkGroupID.x,b=s/p.values[2],lane=gl_SubgroupInvocationID;if((p.values[23]&(1u<<b))!=0)return;
+ float v=lane<16?RF32(binding_address(0)).values[s*16+lane]:-1.0/0.0,m=subgroupMax(v);uint id=subgroupMin(lane<16&&v==m?RU32(binding_address(1)).values[s*16+lane]:0xffffffffu);if(lane==0)WU32(binding_address(2)).values[s]=id;}

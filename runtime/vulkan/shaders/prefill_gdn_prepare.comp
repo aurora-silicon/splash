@@ -1,0 +1,19 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "gdn_common.glsl"
+shared float sums[8];
+void main(){
+ uint task=gl_WorkGroupID.x,t=task/16,h=task%16,i=gl_LocalInvocationIndex,lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;
+ uint64_t packed=binding_address(0),weights=binding_address(1),state=binding_address(2);
+ uint qc=h*128+i,kc=KW+qc,vc=2*KW+h*(VH/16)*128+i;
+ float q=conv(packed,weights,state,packed,pw(),0,t,qc),k=conv(packed,weights,state,packed,pw(),0,t,kc);
+ float qs=subgroupAdd(q*q),ks=subgroupAdd(k*k);
+ if(lane==0){sums[sg]=qs;sums[4+sg]=ks;}barrier();
+ if(i==0){sums[0]=inversesqrt((sums[0]+sums[1]+sums[2]+sums[3])/128.0+1e-6);sums[4]=inversesqrt((sums[4]+sums[5]+sums[6]+sums[7])/128.0+1e-6);}barrier();
+ wb(binding_address(4),t*KW+qc,round_b(q*sums[0])*0.0078125);
+ wb(binding_address(5),t*KW+qc,round_b(k*sums[4])*0.08838834765);
+ for(uint v=0;v<VH/16;++v)wb(binding_address(6),t*vw()+vc+v*128-2*KW,conv(packed,weights,state,packed,pw(),0,t,vc+v*128));
+ if(i<VH/16){uint head=h*(VH/16)+i;vec2 g=gates(packed,binding_address(7),binding_address(8),t,head);WF32(binding_address(9)).values[t*VH+head]=g.x;wb(binding_address(10),t*VH+head,g.y);}
+ if(t==0){uint tokens=RU32(binding_address(11)).values[0];for(uint row=0;row<3;++row)for(uint v=0;v<VH/16+2;++v){uint ch=v==0?qc:v==1?kc:vc+(v-2)*128;wb(binding_address(3),row*cd()+ch,carried(state,packed,pw(),tokens,row,ch));}}
+}

@@ -1,0 +1,4 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main(){uint i=gl_GlobalInvocationID.x,n=RU32(binding_address(2)).values[0];if(i<n)WF32(binding_address(1)).values[i]=bf16_float(R16(binding_address(0)).values[i]);}

@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define SPLASH_LOCAL_SIZE_DEFAULT 256
+#include "common.glsl"
+layout(constant_id=3)const uint K_SPLITS=1;
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {
+ uint rows,input_size,out_stride,plane_input_size;uint cols[3],fmt[3],offset[3];
+ uint epilogue,output_f32,row_start,active_rows,input_f32;
+};
+void main(){
+ Params p=Params(binding_address(12));uint index=gl_GlobalInvocationID.x;
+ if(index>=p.rows*p.out_stride)return;
+ uint row=index/p.out_stride,col=index%p.out_stride;bool live=false;
+ [[unroll]]for(uint s=0;s<3;++s)if(col>=p.offset[s]&&col-p.offset[s]<p.cols[s])live=true;
+ if(!live)return;
+ precise float sum=0;
+ [[unroll]]for(uint part=0;part<K_SPLITS;++part)sum+=RF32(binding_address(15)).values[part*p.rows*p.out_stride+index];
+ uint output_index=(row+p.row_start)*p.out_stride+col;
+ if(p.epilogue==1)sum+=bf16_float(R16(binding_address(11)+2*output_index).values[0]);
+ if(p.epilogue==2){float gate=bf16_float(R16(binding_address(11)+2*output_index).values[0]);sum=bf16_float(float_bf16(sum))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+ if(row%8>=p.active_rows)sum=0;
+ if(p.output_f32!=0)WF32(binding_address(10)+4*output_index).values[0]=sum;else W16(binding_address(10)+2*output_index).values[0]=float_bf16(sum);
+}

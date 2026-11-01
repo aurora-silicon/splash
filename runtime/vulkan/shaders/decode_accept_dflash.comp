@@ -1,0 +1,12 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+
+layout(constant_id=3)const uint VERIFY_ROWS=8;
+void main(){uint b=gl_WorkGroupID.x;RU32 p=RU32(binding_address(8));uint accepted=0;
+ while(accepted<VERIFY_ROWS-1){uint token=RU32(binding_address(0)).values[b*7+accepted];bool keep;
+ if((p.values[6]&(1u<<b))!=0){float q=0;for(uint i=0;i<16;++i)if(RU32(binding_address(1)).values[(b*7+accepted)*16+i]==token)q=RF32(binding_address(2)).values[(b*7+accepted)*16+i];float prob=RF32(binding_address(3)).values[(b*8+accepted)*4+3];keep=RF32(binding_address(4)).values[b*16+8+accepted]*q<prob;}
+ else keep=token==RU32(binding_address(5)).values[b*8+accepted];if(!keep)break;WU32(binding_address(5)).values[b*8+accepted]=token;++accepted;}
+ uint retained=min(accepted+1,p.values[b]);for(uint i=0;i<retained;++i){uint token=RU32(binding_address(5)).values[b*8+i];if(token==p.values[4]||token==p.values[5]){retained=i+1;break;}}
+ WU32(binding_address(6)).values[b]=retained;WU32(binding_address(7)).values[b]=accepted;}

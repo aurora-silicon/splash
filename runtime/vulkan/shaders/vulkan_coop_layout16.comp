@@ -1,0 +1,20 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+#include "common.glsl"
+layout(buffer_reference,std430,buffer_reference_align=2)writeonly buffer WB16 {bfloat16_t values[];};
+layout(buffer_reference,std430,buffer_reference_align=2)writeonly buffer WH16 {float16_t values[];};
+void main(){
+ coopmat<bfloat16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA>a;
+ coopmat<float16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB>b;
+ coopmat<float,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>c;
+ for(int i=0;i<a.length();++i){float v=float(gl_SubgroupInvocationID*8+uint(i));a[i]=bfloat16_t(v);b[i]=float16_t(v);c[i]=v;}
+ coopMatStore(a,WB16(binding_address(0)).values,0,16,gl_CooperativeMatrixLayoutRowMajor);
+ coopMatStore(b,WH16(binding_address(1)).values,0,16,gl_CooperativeMatrixLayoutRowMajor);
+ coopMatStore(c,WF32(binding_address(2)).values,0,16,gl_CooperativeMatrixLayoutRowMajor);
+}

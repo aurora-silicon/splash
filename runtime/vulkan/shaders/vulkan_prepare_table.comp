@@ -1,0 +1,26 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#define SPLASH_LOCAL_SIZE_DEFAULT 256
+#include "common.glsl"
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {
+ uint rows,input_size,out_stride,plane_input_size;uint cols[3],fmt[3],offset[3];
+ uint epilogue,output_f32,row_start,active_rows,input_f32;
+};
+uint xt_offset(uint j,uint kp,uint row){return (((j>>2)*8+kp)*4+(row>>1))*8+(j&3)*2+(row&1);}
+void main(){
+ Params p=Params(binding_address(12));uint lane=gl_SubgroupInvocationID,row=gl_WorkGroupID.y*8+gl_SubgroupID,span=gl_WorkGroupID.x,k=2*lane;
+ uint pair=0;if(row<p.rows&&gl_SubgroupID<p.active_rows)pair=RU32(binding_address(0)+2*((row+p.row_start)*p.input_size+span*64+k)).values[0];
+ uint16_t a=uint16_t(pair),b=uint16_t(pair>>16);
+ uint q=k>>5,h=(k>>4)&1,v=(k>>2)&3,n=(k>>1)&1,j=4*q+2*h+n,kp=2*v,r=row%8;
+ uint table_base=(row/8)*p.input_size*8+span*512;
+ W16(binding_address(13)).values[table_base+xt_offset(j,kp,r)]=a;
+ W16(binding_address(13)).values[table_base+xt_offset(j,kp+1,r)]=b;
+ precise float sum=bf16_float(a)+bf16_float(b);
+ sum+=subgroupShuffleXor(sum,1);sum+=subgroupShuffleXor(sum,2);sum+=subgroupShuffleXor(sum,4);
+ uint sums_base=(row/8)*(p.input_size/16*8+p.input_size/32*8);
+ if((lane&7)==0)WF32(binding_address(14)).values[sums_base+(span*4+lane/8)*8+r]=-160.0*sum;
+ precise float s32=sum+subgroupShuffleXor(sum,8);
+ if((lane&15)==0)WF32(binding_address(14)).values[sums_base+p.input_size/16*8+(span*2+lane/16)*8+r]=s32;
+}

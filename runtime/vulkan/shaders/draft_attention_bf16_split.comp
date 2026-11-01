@@ -1,0 +1,26 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+void main(){uint h=gl_WorkGroupID.x,b=gl_WorkGroupID.y,split=gl_WorkGroupID.z,lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;
+ RU32 p=RU32(binding_address(11));uint lanes=p.values[1],cache=p.values[2+b],common_start=cache>=2047?cache-2047:0,oldcount=cache-common_start,start=common_start%2048,physicalend=start+oldcount;
+ uint wrapped=physicalend>2048?(physicalend-2048+127)/128:0,tail=(min(physicalend,2048)+127)/128,resume=max(start/128,wrapped),tiles=wrapped+tail-resume;
+ uint64_t qbase=binding_address(0)+uint64_t(b*32768+h*4096)*2;
+ uint64_t partial=binding_address(0)+uint64_t(lanes)*65536+uint64_t(((b*8+h)*4+split)*4160)*4;
+ for(uint fr=sg;fr<32;fr+=8){uint row=fr%8;float accum[4];for(uint j=0;j<4;++j)accum[j]=0;float maximum=-1.0/0.0,total=0;
+ // A split's old tiles, followed by the current eight rows on split three.
+ for(uint iteration=0;iteration<(tiles+3-split)/4+(split==3?1:0);++iteration){uint it=split+4*iteration;bool current=it>=tiles;
+ uint slot=current?0:(it<wrapped?it:resume+it-wrapped)*128;
+ float scores[4];float pageMax=-1.0/0.0;
+ for(uint q=0;q<4;++q){uint tok=q*32+lane;float score=0;bool valid;
+ if(current)valid=tok<8;else{uint key=slot+tok,logical=key>=start?key-start:key+2048-start;uint rowstart=cache+row>=2047?cache+row-2047:0;valid=logical<oldcount&&logical>=rowstart-common_start;}
+ if(valid){uint64_t key=current?binding_address(9)+uint64_t(((b*8+h)*8+tok)*128)*2:binding_address(1+b)+uint64_t((h*2048+slot+tok)*128)*2;
+ for(uint dim=0;dim<128;++dim)score=fma(rb(qbase,fr*128+dim),rb(key,dim),score);score*=0.08838834765;}else score=-1.0/0.0;scores[q]=score;pageMax=max(pageMax,score);}
+ pageMax=subgroupMax(pageMax);float nextmax=max(maximum,pageMax);bool empty=isinf(nextmax);float scale=empty?1:exp(maximum-nextmax),sum=0;
+ for(uint q=0;q<4;++q){scores[q]=empty?0:exp(scores[q]-nextmax);sum+=scores[q];}total=total*scale+subgroupAdd(sum);
+ for(uint j=0;j<4;++j){uint dim=j*32+lane;float val=0;for(uint q=0;q<4;++q)for(uint l=0;l<32;++l){uint tok=q*32+l;float pr=subgroupShuffle(scores[q],l);if(current&&tok>=8)continue;float v=current?rb(binding_address(10),((b*8+h)*128+dim)*8+tok):rb(binding_address(5+b),(h*128+dim)*p.values[0]+slot+tok);val=fma(pr,v,val);}accum[j]=accum[j]*scale+val;}
+ maximum=nextmax;if(current)break;
+ }
+ for(uint j=0;j<4;++j)WF32(partial).values[fr*128+j*32+lane]=accum[j];if(lane==0){WF32(partial).values[4096+fr]=maximum;WF32(partial).values[4128+fr]=total;}
+ }
+}

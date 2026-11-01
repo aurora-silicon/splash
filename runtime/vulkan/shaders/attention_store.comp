@@ -1,0 +1,11 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "attention_common.glsl"
+void main(){uint group=gl_WorkGroupID.x,dim=gl_LocalInvocationIndex,batch=VERIFY?group/(2*8*KH):0,localgroup=VERIFY?group%(2*8*KH):group;
+ uint64_t pa=binding_address(VERIFY?6:3)+uint64_t(batch)*24;RU32 p=RU32(pa);
+ uint committed=p.values[0],tokens=p.values[1],stride=p.values[2],ep=p.values[4],offset=p.values[5];
+ bool value=localgroup>=tokens*KH;uint row=value?localgroup-tokens*KH:localgroup,t=row%tokens,h=row/tokens;
+ uint src=value?((batch*KH+h)*256+dim)*stride+t:((batch*KH+h)*stride+t)*256+dim;
+ uint64_t addr=page_address(binding_address(2+batch),committed+t,h,dim,ep,offset,value);
+ W16(addr).values[0]=R16(binding_address(value?1:0)).values[src];}

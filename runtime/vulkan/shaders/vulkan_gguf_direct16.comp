@@ -1,0 +1,97 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+#define SPLASH_LOCAL_SIZE_DEFAULT 32
+#include "common.glsl"
+#include "quant.glsl"
+#define MA coopmat<bfloat16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA>
+#define MB coopmat<float16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB>
+#define MC coopmat<float,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>
+layout(constant_id=3)const uint FORMAT0=0;
+layout(constant_id=4)const uint FORMAT1=0;
+layout(constant_id=5)const uint FORMAT2=0;
+layout(constant_id=6)const uint EPILOGUE=0;
+layout(constant_id=7)const bool OUTPUT_F32=false;
+layout(constant_id=8)const uint INPUT_WIDTH=0;
+layout(constant_id=9)const uint PLANE_WIDTH=0;
+layout(constant_id=10)const uint OUTPUT_WIDTH=0;
+layout(constant_id=11)const bool FULL_ROWS=false;
+layout(constant_id=12)const uint SEGMENTS=1;
+layout(constant_id=13)const bool FULL_COLUMNS=false;
+layout(constant_id=18)const uint ACTIVE_ROWS=8;
+layout(constant_id=23)const uint ROW_TILE=8;
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {
+ uint rows,input_size,out_stride,plane_input_size;
+ uint cols[3],fmt[3],offset[3];
+ uint epilogue,output_f32,row_start,active_rows,input_f32;
+};
+layout(buffer_reference,std430,buffer_reference_align=2)readonly buffer RB16 {bfloat16_t values[];};
+uint fragment_row(uint lane){return (lane&6)|((lane>>1)&8);}
+uint fragment_column(uint lane){return ((lane&1)<<2)|(lane&8);}
+MA activations(Params p,uint base,uint begin){
+ uint lane=gl_SubgroupInvocationID,r0=fragment_row(lane);
+ uint c0=((lane>>3)&1)|((lane&1)<<3);
+ MA a;
+ [[unroll]]for(uint i=0;i<8;++i){uint row=r0+(i>>2),k=c0+2*(i&3);
+  a[i]=base+row<p.rows&&row<ROW_TILE&&row%8<ACTIVE_ROWS?RB16(binding_address(0)).values[(base+row+p.row_start)*INPUT_WIDTH+begin+k]:bfloat16_t(0);
+ }
+ return a;
+}
+// Keep one 32-value weight group in registers for both native 16x16 steps.
+// Decode to FP16 as upstream Metal does; accumulate across K in FP32.
+struct Q6Weights {uvec4 low,high;vec4 scale0,scale1;};
+Q6Weights load_q6(Params p,uint segment,uint column,uint group){
+ Q6Weights w;uint lane=gl_SubgroupInvocationID,e=fragment_row(lane),slot=8*((e>>2)&3)+(e&3);
+ uint g=group/32,j=g%8,col=column+fragment_column(lane);
+ [[unroll]]for(uint i=0;i<4;++i){
+  w.low[i]=0;w.high[i]=0;w.scale0[i]=0;w.scale1[i]=0;
+  if(FULL_COLUMNS||col+i<p.cols[segment]){
+   uint t=q_tile32(col+i,g,PLANE_WIDTH/32),mt=q_tile32(col+i,g/8,PLANE_WIDTH/256);
+   w.low[i]=RU32(binding_address(1+3*segment)+t*16+4*(slot/8)).values[0];
+   w.high[i]=RU32(binding_address(2+3*segment)+t*8+4*(slot/16)).values[0];
+   uint64_t meta=binding_address(3+3*segment)+mt*20;
+   uint sc=uint(R16(meta+2*j).values[0]);float d=q_half(meta+16);
+   w.scale0[i]=d*float(q_signed(sc&255));w.scale1[i]=d*float(q_signed(sc>>8));
+  }
+ }return w;
+}
+MB q6_matrix(Q6Weights w,uint h){
+ uint e=fragment_row(gl_SubgroupInvocationID),slot=8*((e>>2)&3)+(e&3),ls=4*((slot/2)%4)+8*h,hs=2*(slot%16)+8*h;
+ MB b;
+ [[unroll]]for(uint i=0;i<4;++i){uint low=w.low[i],high=w.high[i];
+  int c0=int(((low>>ls)&15)|(((high>>hs)&3)<<4))-32;
+  int c1=int(((low>>(ls+16))&15)|(((high>>(hs+2))&3)<<4))-32;
+  float scale=h==0?w.scale0[i]:w.scale1[i];
+  b[i]=float16_t(float(c0)*scale);b[i+4]=float16_t(float(c1)*scale);
+ }return b;
+}
+void store_result(Params p,uint segment,uint column,uint base,vec4 lo,vec4 hi){
+ uint lane=gl_SubgroupInvocationID,row0=fragment_row(lane),col0=column+fragment_column(lane);
+ if(row0>=ROW_TILE||(FULL_ROWS&&base+row0>=p.rows))return;
+ [[unroll]]for(uint i=0;i<8;++i){uint row=base+row0+(i>>2),col=col0+(i&3);
+  if((!FULL_ROWS&&row>=p.rows)||(!FULL_COLUMNS&&col>=p.cols[segment]))continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=i<4?lo[i&3]:hi[i&3];
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if((row-base)%8>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}
+void main(){
+ Params p=Params(binding_address(12));uint tile=gl_WorkGroupID.x,t0=(p.cols[0]+15)/16,t1=t0+(p.cols[1]+15)/16;uint segment=SEGMENTS==1?0:tile<t0?0:tile<t1?1:2;uint column=(tile-(segment==0?0:segment==1?t0:t1))*16,base=gl_WorkGroupID.y*ROW_TILE;
+ MC total=MC(0.0);
+ for(uint group=0;group<INPUT_WIDTH;group+=32){
+  Q6Weights weights=load_q6(p,segment,column,group);
+  MA a=activations(p,base,group);MB b=q6_matrix(weights,0);
+  total=coopMatMulAdd(a,b,total);
+  a=activations(p,base,group+16);b=q6_matrix(weights,1);
+  total=coopMatMulAdd(a,b,total);
+ }
+ store_result(p,segment,column,base,vec4(total[0],total[1],total[2],total[3]),vec4(total[4],total[5],total[6],total[7]));
+}

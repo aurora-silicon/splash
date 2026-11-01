@@ -1,0 +1,11 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+
+void main(){uint b=gl_WorkGroupID.x;RU32 p=RU32(binding_address(6));uint lanes=p.values[8],mask=p.values[9],pred=0;float temperature=uintBitsToFloat(p.values[4+b]);
+ for(uint pos=0;pos<7;++pos){float scores[16];for(uint i=0;i<16;++i)scores[i]=RF32(binding_address(1)).values[(b*7+pos)*16+i]+RF32(binding_address(2)).values[lanes*7*128+((b*7+pos)*16+pred)*16+i];uint selected=0;
+ if((mask&(1u<<b))!=0){float maximum=scores[0];for(uint i=1;i<16;++i)maximum=max(maximum,scores[i]);float sum=0;for(uint i=0;i<16;++i){scores[i]=exp((scores[i]-maximum)/temperature);sum+=scores[i];}float cumulative=0;selected=15;for(uint i=0;i<16;++i){float prob=scores[i]/sum;WF32(binding_address(5)).values[(b*7+pos)*16+i]=prob;cumulative+=prob;if(selected==15&&cumulative>RF32(binding_address(3)).values[b*16+1+pos])selected=i;}}
+ else for(uint i=1;i<16;++i)if(scores[i]>scores[selected])selected=i;
+ pred=selected;WU32(binding_address(4)).values[b*7+pos]=RU32(binding_address(0)).values[(b*7+pos)*16+selected];}
+}

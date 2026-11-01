@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "gdn_common.glsl"
+shared float sums[4];
+void main(){
+ uint task=gl_WorkGroupID.x,t=task/VH,h=task%VH,i=gl_LocalInvocationIndex;
+ float v=rb(binding_address(0),task*128+i),s=subgroupAdd(v*v);
+ if(gl_SubgroupInvocationID==0)sums[gl_SubgroupID]=s;barrier();
+ if(i==0)sums[0]=inversesqrt((sums[0]+sums[1]+sums[2]+sums[3])/128.0+1e-6);barrier();
+ float n=round_b(v*sums[0]*norm_weight(binding_address(2),i));
+ float z=rb(binding_address(1),t*pw()+cd()+h*128+i);
+ uint oh=RU32(binding_address(4)).values[0]!=0?(h%(VH/16))*16+h/(VH/16):h;
+ wb(binding_address(3),(t*VH+oh)*128+i,n*silu(z));
+}

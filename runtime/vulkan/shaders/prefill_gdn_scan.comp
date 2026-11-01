@@ -1,0 +1,22 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "gdn_common.glsl"
+void main(){
+ uint group=gl_WorkGroupID.x,h=group/8,row=(group%8)*16+gl_LocalInvocationIndex/8,c=(gl_LocalInvocationIndex%8)*16;
+ uint keyhead=h/(VH/16),base=(h*128+row)*128+c;
+ float s[16];for(uint j=0;j<16;++j)s[j]=state_read(binding_address(5),base+j);
+ uint tokens=RU32(binding_address(8)).values[0];
+ for(uint t=0;t<tokens;++t){
+ float decay=RF32(binding_address(3)).values[t*VH+h],beta=rb(binding_address(4),t*VH+h);
+ float k[16],q[16];vec4 partial=vec4(0);
+ for(uint j=0;j<16;++j){k[j]=rb(binding_address(1),(t*16+keyhead)*128+c+j);q[j]=rb(binding_address(0),(t*16+keyhead)*128+c+j);s[j]*=decay;partial[j%4]=fma(s[j],k[j],partial[j%4]);}
+ float memory=(partial.x+partial.y)+(partial.z+partial.w);
+ for(uint step=1;step<8;step*=2)memory+=subgroupShuffleXor(memory,step);
+ float delta=(rb(binding_address(2),(t*VH+h)*128+row)-memory)*beta;partial=vec4(0);
+ for(uint j=0;j<16;++j){s[j]=fma(k[j],delta,s[j]);partial[j%4]=fma(s[j],q[j],partial[j%4]);}
+ float outv=(partial.x+partial.y)+(partial.z+partial.w);for(uint step=1;step<8;step*=2)outv+=subgroupShuffleXor(outv,step);
+ if(c==0)wb(binding_address(7),(t*VH+h)*128+row,outv);
+ }
+ for(uint j=0;j<16;++j)state_write(binding_address(6),base+j,s[j]);
+}

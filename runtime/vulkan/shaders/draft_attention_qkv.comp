@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+shared float sums[8],normalized[128];
+void main(){uint task=gl_WorkGroupID.x,batch=gl_WorkGroupID.y,i=gl_LocalInvocationIndex;
+ uint element=task*256+i;
+ if(element<8192){uint row=element/1024,rem=element%1024,h=rem/128,dim=rem%128;wb(binding_address(7),((batch*8+h)*128+dim)*8+row,rb(binding_address(0),(batch*8+row)*6144+5120+rem));}
+ if(task>=320)return;bool query=task<256;uint lt=query?task:task-256,heads=query?32:8,row=lt/heads,h=lt%heads;
+ uint src=(batch*8+row)*6144+(query?0:4096)+h*128;
+ float v=i<128?rb(binding_address(0),src+i):0,s=subgroupAdd(v*v);if(gl_SubgroupInvocationID==0)sums[gl_SubgroupID]=s;barrier();
+ if(i==0){float sum=0;for(uint j=0;j<8;++j)sum+=sums[j];sums[0]=inversesqrt(sum/128.0+1e-6);}barrier();
+ if(i<128)normalized[i]=bf16_float(float_bf16(v*sums[0]*rb(binding_address(query?2:3),i)));barrier();
+ if(i<64){float a=normalized[i],b=normalized[i+64],c=RF32(binding_address(4)).values[(batch*8+row)*64+i],sine=RF32(binding_address(5)).values[(batch*8+row)*64+i];uint dst=((batch*heads+h)*8+row)*128;wb(binding_address(query?1:6),dst+i,a*c-b*sine);wb(binding_address(query?1:6),dst+i+64,b*c+a*sine);}
+}

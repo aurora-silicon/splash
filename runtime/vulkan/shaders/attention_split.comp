@@ -1,0 +1,28 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "attention_common.glsl"
+void main(){
+ uint h=gl_WorkGroupID.x,tile=VERIFY?0:gl_WorkGroupID.y,split=VERIFY?gl_WorkGroupID.y:gl_WorkGroupID.z,batch=VERIFY?gl_WorkGroupID.z:0;
+ RU32 p=RU32(binding_address(VERIFY?7:4)+uint64_t(batch)*(VERIFY?24:0));
+ uint committed=p.values[0],rows=VERIFY?8:p.values[1],stride=VERIFY?32:p.values[2],ep=p.values[VERIFY?2:4],offset=p.values[VERIFY?3:5],splits=p.values[VERIFY?4:6],slots=VERIFY?p.values[5]:splits;
+ if(split>=splits)return;uint active_rows=min(8,rows-tile*8),baseCommitted=committed+tile*8,pages=(baseCommitted+active_rows+31)/32,per=(pages+splits-1)/splits;
+ uint begin=split*per,end=min(pages,begin+per);if(begin>=pages)return;
+ uint group=QH/KH,M=8*group,lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;
+ uint64_t slot=VERIFY?(uint64_t(batch)*KH+h)*slots+split:(uint64_t(tile)*KH+h)*splits+split;
+ uint64_t table=binding_address(3+batch);
+ for(uint fr=sg;fr<M;fr+=8){uint row=fr/group,head=fr%group;
+ uint qidx=(((batch*KH+h)*stride+tile*8+row)*group+head)*256;
+ float accum[8];for(uint j=0;j<8;++j)accum[j]=0;float maximum=-1.0/0.0,total=0;
+ for(uint page=begin;page<end;++page){uint token=page*32+lane,limit=baseCommitted+min(row,active_rows-1)+1;float score=0;
+ uint64_t key=page_address(table,token,h,0,ep,offset,false);
+ for(uint dim=0;dim<256;++dim)score=fma(rb(binding_address(0),qidx+dim),rb(key,dim),score);
+ score=token<limit?score*0.0625:-1.0/0.0;float pm=subgroupMax(score),nextmax=max(maximum,pm);
+ float scale=isinf(maximum)?0:exp(maximum-nextmax),prob=isinf(score)?0:exp(score-nextmax);
+ total=total*scale+subgroupAdd(prob);float rounded=bf16_float(float_bf16(prob));
+ for(uint j=0;j<8;++j){uint dim=j*32+lane;float v=0;for(uint t=0;t<32;++t){float pr=subgroupShuffle(rounded,t);v=fma(pr,rb(page_address(table,page*32+t,h,dim,ep,offset,true),0),v);}accum[j]=accum[j]*scale+v;}maximum=nextmax;
+ }
+ for(uint j=0;j<8;++j)WF32(binding_address(1)+4*((slot*M+fr)*256+j*32+lane)).values[0]=accum[j];
+ if(lane==0){WF32(binding_address(2)+8*(slot*M+fr)).values[0]=maximum;WF32(binding_address(2)+8*(slot*M+fr)+4).values[0]=total;}
+ }
+}

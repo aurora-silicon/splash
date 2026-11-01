@@ -1,0 +1,89 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "gdn_common.glsl"
+layout(buffer_reference,std430,buffer_reference_align=8) readonly buffer Params {
+ uint tiled;uint layer;uint64_t conv_bytes;uint64_t recurrent_bytes;uint64_t conv_state_bytes;
+ uint64_t pending_tape[4];uint64_t step_tape[4];uint pending_rows[4];
+};
+shared uint16_t qs[1024],ks[1024],vs[1024],outs[1024],bs[8];
+shared uint16_t pending_keys[1024],pending_values[1024],pending_beta[8];
+shared float ds[8],pending_decay[8];
+void main(){
+ Params p=Params(binding_address(15));uint h=gl_WorkGroupID.x,batch=gl_WorkGroupID.y,lid=gl_LocalInvocationIndex,lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;
+ uint kh=h/(VH/16),token=sg;
+ uint64_t packed=binding_address(0)+uint64_t(batch)*8*pw()*2,weights=binding_address(1);
+ uint64_t cur=binding_address(2+batch),next=binding_address(6+batch);
+ uint64_t ci=cur+uint64_t(p.layer)*p.conv_bytes,co=next+uint64_t(p.layer)*p.conv_bytes;
+ uint64_t si=cur+p.conv_state_bytes+uint64_t(p.layer)*p.recurrent_bytes,so=next+p.conv_state_bytes+uint64_t(p.layer)*p.recurrent_bytes;
+ uint64_t pending=binding_address(10)+p.pending_tape[batch],step=binding_address(10)+p.step_tape[batch];
+ uint kvwidth=KW+vw(),kvOffset=8*cd()*2,decOffset=kvOffset+8*kvwidth*2,betaOffset=decOffset+8*VH*4;
+ uint count=p.pending_rows[batch];
+ if(token<count){
+   for(uint g=0;g<4;++g){uint dim=32*g+lane;
+     pending_keys[token*128+dim]=R16(pending+kvOffset).values[token*kvwidth+kh*128+dim];
+     pending_values[token*128+dim]=R16(pending+kvOffset).values[token*kvwidth+KW+h*128+dim];
+   }
+   if(lane==0){pending_decay[token]=RF32(pending+decOffset).values[token*VH+h];pending_beta[token]=R16(pending+betaOffset).values[token*VH+h];}
+ }
+ float q[4],k[4];
+ for(uint g=0;g<4;++g){uint dim=32*g+lane,qc=kh*128+dim,kc=KW+qc,vc=2*KW+h*128+dim;
+ q[g]=conv(packed,weights,ci,pending,cd(),count,token,qc);k[g]=conv(packed,weights,ci,pending,cd(),count,token,kc);
+ vs[token*128+dim]=float_bf16(conv(packed,weights,ci,pending,cd(),count,token,vc));
+ if(h%(VH/16)==0){wb(step,token*cd()+qc,rb(packed,token*pw()+qc));wb(step,token*cd()+kc,rb(packed,token*pw()+kc));}
+ wb(step,token*cd()+vc,rb(packed,token*pw()+vc));
+ if(token<3){wb(co,token*cd()+vc,carried(ci,pending,cd(),count,token,vc));if(h%(VH/16)==0){wb(co,token*cd()+qc,carried(ci,pending,cd(),count,token,qc));wb(co,token*cd()+kc,carried(ci,pending,cd(),count,token,kc));}}
+ }
+ float qsum=0,ksum=0;for(uint g=0;g<4;++g){qsum+=subgroupAdd(q[g]*q[g]);ksum+=subgroupAdd(k[g]*k[g]);}
+ float qi=inversesqrt(qsum/128.0+1e-6),ki=inversesqrt(ksum/128.0+1e-6);
+ for(uint g=0;g<4;++g){uint dim=32*g+lane;qs[token*128+dim]=float_bf16(round_b(q[g]*qi)*0.0078125);ks[token*128+dim]=float_bf16(round_b(k[g]*ki)*0.08838834765);
+ if(h%(VH/16)==0)wb(step+kvOffset,token*kvwidth+kh*128+dim,bf16_float(ks[token*128+dim]));wb(step+kvOffset,token*kvwidth+KW+h*128+dim,bf16_float(vs[token*128+dim]));}
+ if(lane==0){vec2 g=gates(packed,binding_address(11),binding_address(12),token,h);ds[token]=g.x;bs[token]=float_bf16(g.y);WF32(step+decOffset).values[token*VH+h]=g.x;wb(step+betaOffset,token*VH+h,g.y);}barrier();
+ // Match gdn_decode_scan<128,2>: pending scan, prefetch, commit, verification scan.
+ float state[8];
+ for(uint r=0;r<2;++r)for(uint j=0;j<4;++j)
+   state[4*r+j]=state_read(si,(h*128+r*8+sg)*128+lane*4+j);
+ for(uint block=0;block<16;block+=2){
+   uint rows[2]=uint[2](block*8+sg,(block+1)*8+sg);
+   for(uint t=0;t<count;++t){
+     float d=pending_decay[t],beta=bf16_float(pending_beta[t]);
+     float key[4];for(uint j=0;j<4;++j)key[j]=bf16_float(pending_keys[t*128+lane*4+j]);
+     float memory[2];
+     for(uint r=0;r<2;++r){
+       memory[r]=0;for(uint j=0;j<4;++j){state[4*r+j]*=d;memory[r]+=state[4*r+j]*key[j];}
+       memory[r]=subgroupAdd(memory[r]);
+     }
+     for(uint r=0;r<2;++r){
+       float delta=(bf16_float(pending_values[t*128+rows[r]])-memory[r])*beta;
+       for(uint j=0;j<4;++j)state[4*r+j]+=key[j]*delta;
+     }
+   }
+   float upcoming[8];for(uint i=0;i<8;++i)upcoming[i]=0;
+   if(block+2<16)for(uint r=0;r<2;++r)for(uint j=0;j<4;++j)
+     upcoming[4*r+j]=state_read(si,(h*128+(block+2+r)*8+sg)*128+lane*4+j);
+   for(uint r=0;r<2;++r)for(uint j=0;j<4;++j)
+     state_write(so,(h*128+rows[r])*128+lane*4+j,state[4*r+j]);
+   for(uint t=0;t<8;++t){
+     float d=ds[t],beta=bf16_float(bs[t]);
+     float key[4],query[4];for(uint j=0;j<4;++j){
+       key[j]=bf16_float(ks[t*128+lane*4+j]);query[j]=bf16_float(qs[t*128+lane*4+j]);
+     }
+     float memory[2];
+     for(uint r=0;r<2;++r){
+       memory[r]=0;for(uint j=0;j<4;++j){state[4*r+j]*=d;memory[r]+=state[4*r+j]*key[j];}
+       memory[r]=subgroupAdd(memory[r]);
+     }
+     float result[2];
+     for(uint r=0;r<2;++r){
+       float delta=(bf16_float(vs[t*128+rows[r]])-memory[r])*beta;
+       result[r]=0;for(uint j=0;j<4;++j){state[4*r+j]+=key[j]*delta;result[r]+=state[4*r+j]*query[j];}
+       result[r]=subgroupAdd(result[r]);
+     }
+     if(lane==0)for(uint r=0;r<2;++r)outs[t*128+rows[r]]=float_bf16(result[r]);
+   }
+   for(uint i=0;i<8;++i)state[i]=upcoming[i];
+ }barrier();
+ float sum=0;for(uint g=0;g<4;++g){float v=bf16_float(outs[token*128+32*g+lane]);sum+=subgroupAdd(v*v);}
+ float inv=inversesqrt(sum/128.0+1e-6);uint oh=p.tiled!=0?(h%(VH/16))*16+h/(VH/16):h;
+ for(uint g=0;g<4;++g){uint dim=32*g+lane;float n=round_b(bf16_float(outs[token*128+dim])*inv*norm_weight(binding_address(13),dim));float z=rb(packed,token*pw()+cd()+h*128+dim);wb(binding_address(14),(batch*8*VH+token*VH+oh)*128+dim,n*silu(z));}
+}

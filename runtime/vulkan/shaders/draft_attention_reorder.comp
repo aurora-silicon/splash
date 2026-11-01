@@ -1,0 +1,6 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+void main(){uint i=gl_GlobalInvocationID.x,b=gl_WorkGroupID.y;if(i>=32768)return;uint row=i/4096,head=i/128%32,dim=i%128;
+ W16(binding_address(1)).values[b*32768+i]=R16(binding_address(0)).values[(b*32+head)*1024+row*128+dim];}

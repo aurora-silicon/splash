@@ -1,0 +1,148 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#pragma use_vulkan_memory_model
+#define SPLASH_LOCAL_SIZE_DEFAULT 128
+#include "common.glsl"
+#include "quant.glsl"
+#define MA coopmat<bfloat16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseA>
+#define MB coopmat<bfloat16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseB>
+#define MC coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>
+#ifdef SPLASH_STATIC_FORMAT
+const uint FORMAT0=SPLASH_STATIC_FORMAT;
+#else
+layout(constant_id=3)const uint FORMAT0=4;
+#endif
+layout(constant_id=6)const uint EPILOGUE=0;
+layout(constant_id=7)const bool OUTPUT_F32=false;
+layout(constant_id=8)const uint INPUT_WIDTH=0;
+layout(constant_id=9)const uint PLANE_WIDTH=0;
+layout(constant_id=10)const uint OUTPUT_WIDTH=0;
+layout(constant_id=12)const uint SEGMENTS=1;
+layout(constant_id=13)const bool FULL_COLUMNS=false;
+layout(constant_id=15)const uint K_SPLITS=1;
+layout(constant_id=18)const uint ACTIVE_ROWS=8;
+layout(constant_id=23)const bool FUSED_REDUCTION=false;
+#ifdef SPLASH_DIRECT_LINEAR_PUSH
+struct Params {
+ uint rows,input_size,out_stride,plane_input_size;uint cols[3],fmt[3],offset[3];
+ uint epilogue,output_f32,row_start,active_rows,input_f32;
+};
+Params linear_params() {
+ return Params(direct_linear.parameters[0],direct_linear.parameters[1],direct_linear.parameters[2],direct_linear.parameters[3],
+  uint[3](direct_linear.parameters[4],direct_linear.parameters[5],direct_linear.parameters[6]),
+  uint[3](direct_linear.parameters[7],direct_linear.parameters[8],direct_linear.parameters[9]),
+  uint[3](direct_linear.parameters[10],direct_linear.parameters[11],direct_linear.parameters[12]),
+  direct_linear.parameters[13],direct_linear.parameters[14],direct_linear.parameters[15],direct_linear.parameters[16],direct_linear.parameters[17]);
+}
+#else
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {
+ uint rows,input_size,out_stride,plane_input_size;uint cols[3],fmt[3],offset[3];
+ uint epilogue,output_f32,row_start,active_rows,input_f32;
+};
+#define linear_params() Params(binding_address(12))
+#endif
+layout(buffer_reference,std430,buffer_reference_align=4)nonprivate buffer PartialValues {float values[];};
+layout(buffer_reference,std430,buffer_reference_align=4)nonprivate buffer TileCounters {uint values[];};
+shared uint lastPartition;
+
+void final_store(Params p,uint index,uint row,float value){
+ if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+ if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+ if(row%8>=ACTIVE_ROWS)value=0;
+ if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+}
+void finish(Params p,uint segment,uint column,uint base,uint m,uint n,uint split,vec2 total0,vec2 total1){
+ [[unroll]]for(uint part=0;part<2;++part)[[unroll]]for(uint i=0;i<2;++i){
+  uint row=base+n+i,col=column+part*8+m;
+  if(row>=p.rows||col>=p.cols[segment])continue;
+  uint local_index=row*OUTPUT_WIDTH+p.offset[segment]+col;float value=part==0?total0[i]:total1[i];
+  if(K_SPLITS>1){
+   uint at=split*p.rows*OUTPUT_WIDTH+local_index;
+   value=n+i<ACTIVE_ROWS?value:0.0;
+   if(FUSED_REDUCTION)PartialValues(binding_address(15)).values[at]=value;else WF32(binding_address(15)).values[at]=value;
+  }else final_store(p,(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col,row,value);
+ }
+ if(K_SPLITS>1&&FUSED_REDUCTION){
+  // Each writer publishes its own partials to the queue-family domain.
+  // The atomic release sequence orders all partitions before the final one.
+  controlBarrier(gl_ScopeWorkgroup,gl_ScopeQueueFamily,gl_StorageSemanticsBuffer|gl_StorageSemanticsShared,
+                 gl_SemanticsAcquireRelease|gl_SemanticsMakeAvailable|gl_SemanticsMakeVisible);
+  uint counter=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+  if(gl_LocalInvocationIndex==0){
+   uint previous=atomicAdd(TileCounters(binding_address(16)).values[counter],1u,gl_ScopeQueueFamily,
+                           gl_StorageSemanticsBuffer,gl_SemanticsAcquireRelease|gl_SemanticsMakeAvailable|gl_SemanticsMakeVisible);
+   lastPartition=uint(previous==K_SPLITS-1);
+  }
+  // Every reader acquires visibility directly from the queue-family domain.
+  controlBarrier(gl_ScopeWorkgroup,gl_ScopeQueueFamily,gl_StorageSemanticsBuffer|gl_StorageSemanticsShared,
+                 gl_SemanticsAcquireRelease|gl_SemanticsMakeAvailable|gl_SemanticsMakeVisible);
+  if(lastPartition!=0){
+   [[unroll]]for(uint part=0;part<2;++part)[[unroll]]for(uint i=0;i<2;++i){
+    uint row=base+n+i,col=column+part*8+m;
+    if(row>=p.rows||col>=p.cols[segment])continue;
+    uint local_index=row*OUTPUT_WIDTH+p.offset[segment]+col;
+    precise float sum=0.0;
+    [[unroll]]for(uint k=0;k<K_SPLITS;++k)sum+=PartialValues(binding_address(15)).values[k*p.rows*OUTPUT_WIDTH+local_index];
+    final_store(p,(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col,row,sum);
+   }
+   // All leaders have incremented. The API dependency before the next
+   // dispatch also orders every lane's reads/stores before scratch reuse.
+   if(gl_LocalInvocationIndex==0)atomicExchange(TileCounters(binding_address(16)).values[counter],0u,gl_ScopeQueueFamily,
+                                               gl_StorageSemanticsBuffer,gl_SemanticsRelease);
+  }
+ }
+}
+
+uint matrix_code(uvec2 bits,uint i){
+ if(i<5)return (bits.x>>(6*i))&63;
+ if(i==5)return ((bits.x>>30)|(bits.y<<2))&63;
+ return (bits.y>>(6*i-32))&63;
+}
+uvec2 matrix_payload(uint64_t address,uint offset,uint lane){
+ return uvec2(RU32(address+offset+lane*4).values[0],RU32(address+offset+128+(lane/2)*4).values[0]>>(16*(lane&1)));
+}
+void main(){
+ Params p=linear_params();uint lane=gl_SubgroupInvocationID,m=((lane>>1)&3)|((lane>>2)&4),n=((lane&1)<<1)|((lane>>1)&4),chunk=n/2;
+ uint tile=gl_WorkGroupID.x,cpg=16*gl_NumSubgroups,t0=(p.cols[0]+cpg-1)/cpg,t1=t0+(p.cols[1]+cpg-1)/cpg;
+ uint segment=SEGMENTS==1?0:tile<t0?0:tile<t1?1:2;
+ uint column=(tile-(segment==0?0:segment==1?t0:t1))*cpg+gl_SubgroupID*16,base=gl_WorkGroupID.y*8;
+ bool valid0=FULL_COLUMNS||column+m<p.cols[segment],valid1=FULL_COLUMNS||column+8+m<p.cols[segment];
+ uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),meta=binding_address(3+3*segment);
+ vec2 total0=vec2(0),total1=vec2(0);
+ uint table_base=(base/8)*INPUT_WIDTH*8;
+ uint split=gl_WorkGroupID.z,units=(INPUT_WIDTH+255)/256;
+ for(uint unit=units*split/K_SPLITS*256;unit<units*(split+1)/K_SPLITS*256;unit+=256){
+  uint blockUnits=PLANE_WIDTH/256;
+  uint64_t cache0=w0+((column/8)*blockUnits+unit/256)*1696u,cache1=w0+((column/8+1)*blockUnits+unit/256)*1696u;
+  uvec4 hdr0=RU32x4(cache0+16+m*16).values[0],hdr1=RU32x4(cache1+16+m*16).values[0];
+  float d0=q_half(cache0+m*2),d1=q_half(cache1+m*2);
+  [[unroll]]for(uint j=0;j<8 && unit+j*32<INPUT_WIDTH;++j){
+   uint g=unit/32+j,t0=q_tile32(column+m,g,PLANE_WIDTH/32),t1=q_tile32(column+8+m,g,PLANE_WIDTH/32);
+   uvec2 codes0=matrix_payload(cache0,160+j*192,lane),codes1=matrix_payload(cache1,160+j*192,lane);
+   uint sc0=(hdr0[j>>1]>>(16*(j&1)))&65535,sc1=(hdr1[j>>1]>>(16*(j&1)))&65535;
+   uvec4 input_pairs=RU32x4(binding_address(13)+2*(table_base+(g/2)*512+((g%2*8+m)*4+chunk)*8)).values[0];
+   [[unroll]]for(uint h=0;h<2;++h){
+    MC dot0=MC(0.0),dot1=MC(0.0);
+    [[unroll]]for(uint step=0;step<2;++step){
+     uint f=2*h+step;
+     uint c00=matrix_code(codes0,2*f),c01=matrix_code(codes0,2*f+1);
+     uint c10=matrix_code(codes1,2*f),c11=matrix_code(codes1,2*f+1);
+     MA a0,a1;MB b;
+     // Signed Q6 codes are exact BF16 integers. Direct conversion removes
+     // biased-code activation-sum loads and reduces cancellation error.
+     a0[0]=bfloat16_t(int(c00)-32);a0[1]=bfloat16_t(int(c01)-32);
+     a1[0]=bfloat16_t(int(c10)-32);a1[1]=bfloat16_t(int(c11)-32);
+     b[0]=uintBitsToBFloat16EXT(uint16_t(input_pairs[f]));b[1]=uintBitsToBFloat16EXT(uint16_t(input_pairs[f]>>16));
+     dot0=coopMatMulAdd(a0,b,dot0);dot1=coopMatMulAdd(a1,b,dot1);
+    }
+    total0=fma(vec2(dot0[0],dot0[1]),vec2(d0*float(q_signed((sc0>>(8*h))&255))),total0);
+    total1=fma(vec2(dot1[0],dot1[1]),vec2(d1*float(q_signed((sc1>>(8*h))&255))),total1);
+   }
+  }
+ }
+ finish(p,segment,column,base,m,n,split,total0,total1);
+}

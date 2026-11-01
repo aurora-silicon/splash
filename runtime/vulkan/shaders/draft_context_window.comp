@@ -1,0 +1,12 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+layout(constant_id=3)const bool LOAD=false;
+precise float divide_corrected(float a,float b){precise float q=a/b;precise float r=fma(-q,b,a);precise float result=q+r/b;return result;}
+void main(){RU32 p=RU32(binding_address(2));uint rows=p.values[0],start=p.values[1],width=p.values[2],groups=width/64,task=gl_WorkGroupID.x*8+gl_SubgroupID,row=task/groups,g=task%groups,lane=gl_SubgroupInvocationID;
+ if(row>=rows)return;uint slot=(start+row)%2048,ci=row*width+g*64+lane*2;
+ uint64_t window=binding_address(LOAD?0:1),contexta=binding_address(LOAD?1:0),meta=window+uint64_t(2048)*width/2+uint64_t(slot*groups+g)*4;
+ uint64_t codeAddress=window+uint64_t(slot)*width/2+g*32+(lane&~1u);
+ if(LOAD){vec2 sm=unpackHalf2x16(RU32(meta).values[0]);uint packed=uint(R16(codeAddress).values[0])>>(8*(lane&1));wb(contexta,ci,fma(float(packed&15),sm.x,sm.y));wb(contexta,ci+1,fma(float((packed>>4)&15),sm.x,sm.y));}
+ else{float a=rb(contexta,ci),b=rb(contexta,ci+1),low=subgroupMin(min(a,b)),high=subgroupMax(max(a,b));uint smbits=packHalf2x16(vec2(divide_corrected(high-low,15.0),low));vec2 sm=unpackHalf2x16(smbits);uint x=sm.x>0?uint(clamp(roundEven(divide_corrected(a-sm.y,sm.x)),0.0,15.0)):0,y=sm.x>0?uint(clamp(roundEven(divide_corrected(b-sm.y,sm.x)),0.0,15.0)):0,code=x|(y<<4),other=subgroupShuffleXor(code,1);if((lane&1)==0)W16(codeAddress).values[0]=uint16_t(code|(other<<8));if(lane==0)WU32(meta).values[0]=smbits;}}

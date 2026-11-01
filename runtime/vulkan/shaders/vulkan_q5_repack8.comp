@@ -1,0 +1,30 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#define SPLASH_LOCAL_SIZE_DEFAULT 128
+#include "common.glsl"
+#include "quant.glsl"
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {uint width,rows;};
+uint code_at(uint row,uint k,uint groups){
+ uint e=k%32,slot=8*((e>>2)&3)+4*(e>>4)+(e&3),t=q_tile32(row,k/32,groups);
+ uint lo=RU32(binding_address(0)+t*16+4*(slot/8)).values[0],hi=RU32(binding_address(1)+t*4).values[0];
+ return ((lo>>(4*((slot/2)%4)+16*(slot&1)))&15)|(((hi>>slot)&1)<<4);
+}
+void main(){
+ Params p=Params(binding_address(4));uint units=p.width/256;
+ uint frameIndex=(gl_WorkGroupID.x+gl_NumWorkGroups.x*gl_WorkGroupID.y)*4+gl_SubgroupID;
+ if(frameIndex>=p.rows*units)return;
+ uint lane=gl_SubgroupInvocationID,frame=frameIndex%8,unit=(frameIndex/8)%units,block=frameIndex/(8*units);
+ uint64_t dst=binding_address(3)+(block*units+unit)*1408u;
+ uint lo=0,hi=0;
+ [[unroll]]for(uint i=0;i<8;++i){
+  uint f=i/2,n=((lane&1)<<1)|((lane>>1)&4),row=block*8+((lane>>1)&3)+((lane>>2)&4);
+  uint k=unit*256+frame*32+(f>>1)*16+(f&1)*2+(n/2)*4+(i&1),code=code_at(row,k,p.width/32);
+  if(i<6)lo|=code<<(5*i);else if(i==6){lo|=(code&3)<<30;hi|=code>>2;}else hi|=code<<3;
+ }
+ WU32(dst+128+frame*128+lane*4).values[0]=lo;
+ uint packed=hi|(subgroupShuffleXor(hi,1)<<8);packed|=subgroupShuffleXor(packed,2)<<16;
+ if((lane&3)==0)WU32(dst+128+1024+frame*32+lane).values[0]=packed;
+ if(frame==0){uint m=q_tile32(block*8+lane/4,unit,units)*16;WU32(dst+lane*4).values[0]=RU32(binding_address(2)+m+(lane%4)*4).values[0];}
+}

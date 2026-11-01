@@ -1,0 +1,9 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+void main(){uint h=gl_WorkGroupID.x,b=gl_WorkGroupID.y,i=gl_LocalInvocationIndex,row=i/8,dim=(i%8)*16,lanes=RU32(binding_address(1)).values[1];
+ uint64_t partial=binding_address(0)+uint64_t(lanes)*65536+uint64_t((b*8+h)*4*4160)*4;float maximum=-1.0/0.0;
+ for(uint s=0;s<4;++s)maximum=max(maximum,RF32(partial).values[s*4160+4096+row]);float total=0,outv[16];for(uint j=0;j<16;++j)outv[j]=0;
+ for(uint s=0;s<4;++s){float m=RF32(partial).values[s*4160+4096+row];if(isinf(m))continue;float w=exp(m-maximum);total+=w*RF32(partial).values[s*4160+4128+row];for(uint j=0;j<16;++j)outv[j]+=w*RF32(partial).values[s*4160+row*128+dim+j];}
+ for(uint j=0;j<16;++j)wb(binding_address(0),(b*32768+h*4096)+row*128+dim+j,outv[j]/total);}

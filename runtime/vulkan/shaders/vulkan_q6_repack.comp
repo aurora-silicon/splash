@@ -1,0 +1,47 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#define SPLASH_LOCAL_SIZE_DEFAULT 128
+#include "common.glsl"
+#include "quant.glsl"
+layout(constant_id=3)const bool WIDE=false;
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {uint width,rows;};
+uint code_at(uint row,uint k,uint groups){
+ uint e=k%32,slot=8*((e>>2)&3)+4*(e>>4)+(e&3),t=q_tile32(row,k/32,groups);
+ uint lo=RU32(binding_address(0)+t*16+4*(slot/8)).values[0];
+ uint hi=RU32(binding_address(1)+t*8+4*(slot/16)).values[0];
+ return ((lo>>(4*((slot/2)%4)+16*(slot&1)))&15)|(((hi>>(2*(slot%16)))&3)<<4);
+}
+void main(){
+ Params p=Params(binding_address(4));uint rowBlock=WIDE?16:8,frames=WIDE?16:8,header=WIDE?320:160,stride=WIDE?3392:1696;
+ uint frameIndex=(gl_WorkGroupID.x+gl_NumWorkGroups.x*gl_WorkGroupID.y)*4+gl_SubgroupID,units=p.width/256;
+ if(frameIndex>=p.rows/rowBlock*units*frames)return;
+ uint lane=gl_SubgroupInvocationID,frame=frameIndex%frames,unit=(frameIndex/frames)%units,block=frameIndex/(frames*units);
+ uint64_t dst=binding_address(3)+(block*units+unit)*stride;
+ uint lo=0,hi=0;
+ [[unroll]]for(uint i=0;i<8;++i){
+  uint row,k;
+  if(WIDE){row=block*16+(lane&6)+((lane>>1)&8)+(i>>2);k=unit*256+frame*16+((lane>>3)&1)+((lane&1)<<3)+((i&3)<<1);}
+  else{uint f=i/2,n=((lane&1)<<1)|((lane>>1)&4);row=block*8+((lane>>1)&3)+((lane>>2)&4);k=unit*256+frame*32+(f>>1)*16+(f&1)*2+(n/2)*4+(i&1);}
+  uint code=code_at(row,k,p.width/32);
+  if(i<5)lo|=code<<(6*i);else if(i==5){lo|=(code&3)<<30;hi|=code>>2;}else hi|=code<<(6*i-32);
+ }
+ WU32(dst+header+frame*192+lane*4).values[0]=lo;
+ W16(dst+header+frame*192+128+lane*2).values[0]=uint16_t(hi);
+ if(frame==0){
+  if(lane<rowBlock){uint m=q_tile32(block*rowBlock+lane,unit,units)*20;W16(dst+lane*2).values[0]=R16(binding_address(2)+m+16).values[0];}
+  if(WIDE){
+   [[unroll]]for(uint j=0;j<4;++j){uint ix=lane+j*32,pair=ix/16,h=ix%16;
+    uint m0=q_tile32(block*16+pair*2,unit,units)*20,m1=q_tile32(block*16+pair*2+1,unit,units)*20;
+    uint a=(uint(R16(binding_address(2)+m0+(h&~1u)).values[0])>>(8*(h&1)))&255;
+    uint b=(uint(R16(binding_address(2)+m1+(h&~1u)).values[0])>>(8*(h&1)))&255;
+    W16(dst+32+ix*2).values[0]=uint16_t(a|(b<<8));
+   }
+   if(lane<8)WU32(dst+288+lane*4).values[0]=0;
+  }else{
+   uint m=q_tile32(block*8+lane/4,unit,units)*20;
+   WU32(dst+16+lane*4).values[0]=RU32(binding_address(2)+m+(lane%4)*4).values[0];
+   if(lane<4)WU32(dst+144+lane*4).values[0]=0;
+  }
+ }
+}

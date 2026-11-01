@@ -1,0 +1,7 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+void main(){uint i=gl_GlobalInvocationID.x;uint t=RU32(binding_address(8)).values[0],n=RU32(binding_address(8)).values[1];
+ if(i<t*32){uint row=i/32,dim=i%32;float a=float(RU32(binding_address(0)).values[row*3+dim%3])*RF32(binding_address(2)).values[dim];WF32(binding_address(4)).values[i]=cos(a);WF32(binding_address(5)).values[i]=sin(a);}
+ if(i<n*64){float a=float(RU32(binding_address(1)).values[i/64])*RF32(binding_address(3)).values[i%64];WF32(binding_address(6)).values[i]=cos(a);WF32(binding_address(7)).values[i]=sin(a);}}

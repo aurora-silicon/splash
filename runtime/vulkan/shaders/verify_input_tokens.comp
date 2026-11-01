@@ -1,0 +1,9 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+void main() {
+ uint i=gl_GlobalInvocationID.x, row=i%8, batch=i/8;
+ uint token=row==0?RU32(binding_address(0)).values[batch*8]:RU32(binding_address(1)).values[batch*7+row-1];
+ uint vocab=RU32(binding_address(3)).values[0];
+ WU32(binding_address(2)).values[i]=min(token,vocab-1);
+}

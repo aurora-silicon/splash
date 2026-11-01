@@ -1,0 +1,378 @@
+{
+  "format": 1,
+  "status": "recovered-port-overlay",
+  "qualification": {
+    "target": "Qwen3.8-27B-UD-Q6_K.gguf",
+    "target_sha256": "c9c206812fbe4ac7b76a729e25928b63f2ae89d37f69da7a71c20aec763cd436",
+    "driver_sha256": "809070498bdcfbe9ee1adff5df2422df7dce3acde751c488c66c7563c3bd9707",
+    "coding_tokens_per_second": 50.04298702378492,
+    "long_prompt_tokens_per_second": 40.9
+  },
+  "files": [
+    {
+      "path": "runtime/vulkan/README.md",
+      "sha256": "f92b678119ca65f272311fb7a1f74cce770316a6bf7fbafe893e45f99d5c728c",
+      "bytes": 880
+    },
+    {
+      "path": "runtime/vulkan/VulkanBackend.cpp",
+      "sha256": "3622ab5bbdc5342a7746472b250b2231354d269ad930f16fbaf0861a22c84a8a",
+      "bytes": 124028
+    },
+    {
+      "path": "runtime/vulkan/abi/Linear.h",
+      "sha256": "7355d2e29a09d19cbdddbf8dbcbd1adc0d3050201cd40363265fc25c3b2c6e25",
+      "bytes": 1293
+    },
+    {
+      "path": "runtime/vulkan/metal/native-pair-fixed16.metal",
+      "sha256": "b0adf00f72c0cfd973938b57be9ecc7658f6e6ba03ab36995a14c37a4f76b8d3",
+      "bytes": 13774
+    },
+    {
+      "path": "runtime/vulkan/metal/native-singles-build.py",
+      "sha256": "4e2881d65a67497e1b3041f5bf7a8bc71c308c42b67ae3b6a6c379137d65fde0",
+      "bytes": 2432
+    },
+    {
+      "path": "runtime/vulkan/metal/native-singles-fixed16.metal",
+      "sha256": "d171572a10501d2b6ac3ee84f7d0353e2561c8c5c0d40cb101efbe2b3c93c574",
+      "bytes": 9050
+    },
+    {
+      "path": "runtime/vulkan/native/G17GPairData.hpp",
+      "sha256": "c5f80c94e184fbc616a25909511b7c7196246566b341f18bb49b8f8c10955fec",
+      "bytes": 579
+    },
+    {
+      "path": "runtime/vulkan/native/G17GSingleData.hpp",
+      "sha256": "034b8bda368f7fc640e73bb5f7d53610c9bb003431dac2d4d01eaeace0c19b61",
+      "bytes": 1703
+    },
+    {
+      "path": "runtime/vulkan/native/native-f3.bin",
+      "sha256": "6faf6a918a5a7d3a3a3bcc9a2aa529e42b34c911ebf2c8e913e02b14385d85b2",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-f4.bin",
+      "sha256": "a78dc5e3bca42f8d691f3c26898970b60de7794e74c16881a49e731aa2f2784b",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q5k_m8_a.bin",
+      "sha256": "85deb90ac9395586a2e6834369899603c1ddde0335e1a146fa3bc1de9b5d4206",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q5k_m8_a_f32.bin",
+      "sha256": "565bd7893dff376e121243e08492d1c4ba2cfbac997fc1f357ddfd9034d01d8e",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q5k_m8_g.bin",
+      "sha256": "69e2aae856e4502f429d45becc078560151f0f0f0dbb6d369ece6599ea9049f9",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q5k_m8_r.bin",
+      "sha256": "b8b69338842c706ecf6292499a20fe4a98d867ed4b34ca8e940dab7a6cdba01f",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q6k_m8_a.bin",
+      "sha256": "da3943cd18360b4fa39522c19f1a449cbbf5b9f3931026ae977a9cf4a589cad3",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q6k_m8_a_f32.bin",
+      "sha256": "0130a2005f778e1b8a5a13304a86ed7dac9bb270fabf0012513aa43a357fed39",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q6k_m8_g.bin",
+      "sha256": "39f75a387f75984d5b93c07ab323ddc3aff9c39802f549a1709c76b4674cc83b",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/native/native-single-q6k_m8_r.bin",
+      "sha256": "3afe66cb1d5d82c7de946dc05490b2577f67152ba7d54463c603c19b07a592ea",
+      "bytes": 41758
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_common.glsl",
+      "sha256": "67c373b26e1b5f166ecf7d1aaa16c533606864f129e01d78d160bcdcc441f028",
+      "bytes": 863
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_gate.comp",
+      "sha256": "0bf29c9a8c0bbc0de41a8d5cbb54f6d4e28d92e16bfcb23a28f551beb5a0171c",
+      "bytes": 656
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_qkv.comp",
+      "sha256": "65cb9143dcb317645143abfba8d1ed434d059ac45b591b2e309c48727c23729b",
+      "bytes": 1472
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_reduce.comp",
+      "sha256": "233c904276ba323645904e9b0fba9b51611a1d8a5b83abbc463661d8dcbe7174",
+      "bytes": 1364
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_split.comp",
+      "sha256": "ebfaeda2ea31e3dde89d27b7ec435e394e30199abe053d6942c1401adc50db37",
+      "bytes": 2181
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_split_page32.comp",
+      "sha256": "ee2fe7135eeefe2e98c9ef7353a6b9486d8d7699836fe08d96ce380b50e8c1e8",
+      "bytes": 4308
+    },
+    {
+      "path": "runtime/vulkan/shaders/attention_store.comp",
+      "sha256": "33fe73ddeb44852c5c90fec5db834234928463f835c1462021e1ca6cd4baffe7",
+      "bytes": 779
+    },
+    {
+      "path": "runtime/vulkan/shaders/common.glsl",
+      "sha256": "8fed80d2c85d32136fc07774d9bfa961e90156a2fd493e99e471481e939ce252",
+      "bytes": 2441
+    },
+    {
+      "path": "runtime/vulkan/shaders/copy_rows_bf16.comp",
+      "sha256": "6982df977d65a258a27617ada298435416c34f8de79b872bbec55ad03ef2c917",
+      "bytes": 1788
+    },
+    {
+      "path": "runtime/vulkan/shaders/decode_accept_dflash.comp",
+      "sha256": "092952ca106ecd85f3e3c561a8090ef06d660e21ba98fbb13c4afc6b68444654",
+      "bytes": 1074
+    },
+    {
+      "path": "runtime/vulkan/shaders/decode_sample_argmax_reduce.comp",
+      "sha256": "496744f421d7914ae4a1a7170950247af85a319dc8eaa4e4213db056af5c7677",
+      "bytes": 492
+    },
+    {
+      "path": "runtime/vulkan/shaders/decode_sample_argmax_sharded.comp",
+      "sha256": "77582ef51efb0d51aa2b6921f8b79c8a94b19a52e14716530d56fb1b133fea7c",
+      "bytes": 1268
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_attention_bf16_reduce.comp",
+      "sha256": "b611883634297b95db40088d7be4ca2fe1572ddfd39d99342309743370971128",
+      "bytes": 836
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_attention_bf16_split.comp",
+      "sha256": "c9f18f2f6a054f50b740597b1e8ec8b955916bed4c84d6dfb445847fc03a971f",
+      "bytes": 2549
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_attention_qkv.comp",
+      "sha256": "eabf527df5ed8f993c0ca152d028fd1068d4ea4be25d8cca21b16ba146068d07",
+      "bytes": 1248
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_attention_reorder.comp",
+      "sha256": "0527d2f7cef52f4474f0f5965474843089bfa687fec45b788ebc96c533c401f1",
+      "bytes": 342
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_common.glsl",
+      "sha256": "cd9eb2e5de37847912d67a4995bccc06c1df7dc2b3a4e19ff9d6656c46060b06",
+      "bytes": 241
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_context_kv.comp",
+      "sha256": "c714db74ea14b381f0edb8c15da431feb27bd23f6328b9b12b55351bf8604e22",
+      "bytes": 1380
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_context_window.comp",
+      "sha256": "16cb8a1e2fef2409055bae4bde9ba3ef927718ab513eb1818344338b929eefa7",
+      "bytes": 1527
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_conv.comp",
+      "sha256": "cde5bc3473097067b3f77c7c7271fa1627399525d25a3042578520445c9a5c5d",
+      "bytes": 795
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_select_dflash.comp",
+      "sha256": "b7492eee1ea022255e72c6bb654e6682b1cce1859eb4b8d0eb4aa3dbce38affa",
+      "bytes": 1111
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_select_edges.comp",
+      "sha256": "b14c2a30c17d3b9581d6de01e854fc1857878e1a755f8291ab904776792174bf",
+      "bytes": 1582
+    },
+    {
+      "path": "runtime/vulkan/shaders/draft_select_top16_sharded.comp",
+      "sha256": "371c01db5372092c42efb1e7b5d493180902b23f85955faa73ad26b9e6722064",
+      "bytes": 4031
+    },
+    {
+      "path": "runtime/vulkan/shaders/gdn_common.glsl",
+      "sha256": "e68d9d51c37a72d8e98ef6543eff260e0aed459ba45a156e7c7a1ec8fa0acadd",
+      "bytes": 1679
+    },
+    {
+      "path": "runtime/vulkan/shaders/gguf_embed.comp",
+      "sha256": "cbc691ec1a5536ced48188996046b56aeed095e611293f336e11610e6d9b9697",
+      "bytes": 769
+    },
+    {
+      "path": "runtime/vulkan/shaders/gguf_repack.comp",
+      "sha256": "f41f611b9a47746969162ae05e820b58226f8b3a19fb8be5adb2a3c87749c9c1",
+      "bytes": 5104
+    },
+    {
+      "path": "runtime/vulkan/shaders/native_quant.glsl",
+      "sha256": "eeac495e65d4bfa69b0a15f1d819769173d19fa3e49a71c2bc153f146a646e84",
+      "bytes": 2763
+    },
+    {
+      "path": "runtime/vulkan/shaders/norm_rms.comp",
+      "sha256": "19f541c2662e5fcb264eb2b9b97ab4afb80efcf4a9111835d08d5d26689a246f",
+      "bytes": 5886
+    },
+    {
+      "path": "runtime/vulkan/shaders/prefill_gdn_gate.comp",
+      "sha256": "228f875237fa3271b7f42b635b41708f953306254c1d03d4f8cea352fab3e187",
+      "bytes": 679
+    },
+    {
+      "path": "runtime/vulkan/shaders/prefill_gdn_prepare.comp",
+      "sha256": "4d684406695e925c4e2bc6110a25ac68615a957cf0f94815591654565632eb5a",
+      "bytes": 1435
+    },
+    {
+      "path": "runtime/vulkan/shaders/prefill_gdn_scan.comp",
+      "sha256": "5571e84b4dca05bb7dca840becde908bd671f8a8954e2dd3c2d6d3b0db2f53d3",
+      "bytes": 1318
+    },
+    {
+      "path": "runtime/vulkan/shaders/quant.glsl",
+      "sha256": "d00092142fb13f3e63226659a26714b46f384b52944eaccf8a94419f5132a7bc",
+      "bytes": 4984
+    },
+    {
+      "path": "runtime/vulkan/shaders/rope_build_draft_range_tables.comp",
+      "sha256": "c8bb52eabd44c6fcfd4a8daabd491a0f42e99fc891a90868b35f98eb0b1b4cb1",
+      "bytes": 377
+    },
+    {
+      "path": "runtime/vulkan/shaders/rope_build_tables.comp",
+      "sha256": "2a2267369edf4cb8417c2aa521871cf2bc3dd585cf008b4b61054c960d7d7600",
+      "bytes": 617
+    },
+    {
+      "path": "runtime/vulkan/shaders/verify_gdn_fused.comp",
+      "sha256": "368f7084ff36925d7e1f211d11e061986e2c0046756a2eb8e517d728cca26715",
+      "bytes": 5552
+    },
+    {
+      "path": "runtime/vulkan/shaders/verify_input_tokens.comp",
+      "sha256": "13a29f33b7065eafe5d2c67a98caa770e25abed5bd57626f612f08065616e2b4",
+      "bytes": 366
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_coop_layout.comp",
+      "sha256": "63b157f875f26703d2777b847f767d23dfecb315748d527258ddd74699c1ae05",
+      "bytes": 1019
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_coop_layout16.comp",
+      "sha256": "e290322e2066e86311f41f9a0282250ce31f610a648666179356216bb3dc1348",
+      "bytes": 1169
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_coop.comp",
+      "sha256": "0f87b3940caba915deabdd0426680b472f098beb8aa6439a41c13ab1981fd64e",
+      "bytes": 21355
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_direct16.comp",
+      "sha256": "3f2ae00b53ec66acfb59a85e6e62bce3701a039dd9e84302d8aa8dcfb1ee26fa",
+      "bytes": 5182
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_linear.comp",
+      "sha256": "c18671bf2ac7b2d324f79c3eb38ac2c911db3d80b65a5bc0669c9d6ee2aec00b",
+      "bytes": 4359
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_matvec.comp",
+      "sha256": "3c08bd96b288a6991456640ad2ec10ac3697742dd7314e5ee4090a161ff3034e",
+      "bytes": 9496
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_register.comp",
+      "sha256": "409941bd046343685c62fc6b9631caa1686eb1bc683409aac25d24c3ac7fdb24",
+      "bytes": 13237
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_register16.comp",
+      "sha256": "ff9e5bd982690c26826455629058773d27f18c6e2d99fbadbf72391d31daac60",
+      "bytes": 12398
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_register_q5.comp",
+      "sha256": "2fb2b38d23cfea2e33a1813d31a104687b6322ce56031f2a0cf9068c74ef793d",
+      "bytes": 8483
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_register_q6.comp",
+      "sha256": "206dc9efd22aca05b03b0e1197b6c2c701953634497e19fb9e14f37292fbf7ec",
+      "bytes": 8466
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_gguf_staged16.comp",
+      "sha256": "64ad4f160126f76ec15e305fbbee238f3a945851491afaa17b5e31c420fdb5c3",
+      "bytes": 7996
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_prepare_table.comp",
+      "sha256": "814ca22d31956c75874dc79fb3cae9c04ac053b97f4da9f44bd0b0cc6174d895",
+      "bytes": 1601
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_prepare_table16.comp",
+      "sha256": "89efc1dac85b8956f23fb35e0921c815b9718b0176c460020bbb9ef2f89d2a22",
+      "bytes": 1607
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_q5_repack8.comp",
+      "sha256": "362ab5866e616a2dc48cd41a01ea7fbd0f8336f710c200b52ae0559e57044948",
+      "bytes": 1661
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_q6_repack.comp",
+      "sha256": "534d4f1e595552963dc9d02862c9168729105c8d85f575c88759e4c12bc322d1",
+      "bytes": 2500
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_q6_repack_commit.comp",
+      "sha256": "e9ad76ed1ad59d44fe57327da13f23408e6d7a39ff7e9f0ed992bce1317db653",
+      "bytes": 534
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_register_reduce.comp",
+      "sha256": "9b68a195c247d0c7a89b84162d66920554833a1aec907e9626202c15c2f1e6fc",
+      "bytes": 1322
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_test_dequant.comp",
+      "sha256": "1accb6c18de1d9a7e3bfbf998613a777f0080f258d6af6bd195af2ef19140eb1",
+      "bytes": 521
+    },
+    {
+      "path": "runtime/vulkan/shaders/vulkan_widen_input.comp",
+      "sha256": "8fc96636f92bc1cdb2d7f534b510799106155b3fa68673b3a619cb2aa653c0bd",
+      "bytes": 255
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "attention_common.glsl"
+shared float weights[128];
+void main(){uint h=gl_WorkGroupID.x,fr=gl_WorkGroupID.y,tile=VERIFY?0:gl_WorkGroupID.z,batch=VERIFY?gl_WorkGroupID.z:0,dim=gl_LocalInvocationIndex;
+ RU32 p=RU32(binding_address(3)+uint64_t(batch)*(VERIFY?24:0));uint committed=p.values[0],rows=VERIFY?8:p.values[1],stride=VERIFY?32:p.values[2],splits=p.values[VERIFY?4:6],slots=VERIFY?p.values[5]:splits;
+ uint active_rows=min(8,rows-tile*8),group=QH/KH,M=8*group;
+ uint dst=(((batch*KH+h)*stride+tile*8)*group+fr)*256+dim;
+ if(fr/group>=active_rows){wb(binding_address(2),dst,0);return;}
+ uint pages=(committed+tile*8+active_rows+31)/32,per=(pages+splits-1)/splits,written=(pages+per-1)/per;
+ uint64_t slot=VERIFY?(uint64_t(batch)*KH+h)*slots:(uint64_t(tile)*KH+h)*splits;
+ if(dim==0){float maximum=-1.0/0.0;for(uint s=0;s<written;++s)maximum=max(maximum,RF32(binding_address(1)+8*((slot+s)*M+fr)).values[0]);for(uint s=0;s<written;++s)weights[s]=exp(RF32(binding_address(1)+8*((slot+s)*M+fr)).values[0]-maximum);}barrier();
+ float num=0,den=0;for(uint s=0;s<written;++s){float w=weights[s];num+=w*RF32(binding_address(0)+4*(((slot+s)*M+fr)*256+dim)).values[0];den+=w*RF32(binding_address(1)+8*((slot+s)*M+fr)+4).values[0];}wb(binding_address(2),dst,den>0?num/den:0);}

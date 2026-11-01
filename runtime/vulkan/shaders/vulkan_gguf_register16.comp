@@ -1,0 +1,196 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+#define SPLASH_LOCAL_SIZE_DEFAULT 32
+#include "common.glsl"
+#include "quant.glsl"
+#define MA coopmat<bfloat16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA>
+#define MB coopmat<bfloat16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB>
+#define MC coopmat<float,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>
+#ifdef SPLASH_STATIC_FORMAT
+const uint FORMAT0=SPLASH_STATIC_FORMAT;
+#else
+layout(constant_id=3)const uint FORMAT0=4;
+#endif
+layout(constant_id=4)const uint FORMAT1=4;
+layout(constant_id=5)const uint FORMAT2=4;
+layout(constant_id=6)const uint EPILOGUE=0;
+layout(constant_id=7)const bool OUTPUT_F32=false;
+layout(constant_id=8)const uint INPUT_WIDTH=0;
+layout(constant_id=9)const uint PLANE_WIDTH=0;
+layout(constant_id=10)const uint OUTPUT_WIDTH=0;
+layout(constant_id=11)const bool FULL_ROWS=false;
+layout(constant_id=12)const uint SEGMENTS=1;
+layout(constant_id=13)const bool FULL_COLUMNS=false;
+layout(constant_id=15)const uint K_SPLITS=1;
+layout(constant_id=18)const uint ACTIVE_ROWS=8;
+layout(constant_id=23)const uint ROW_TILE=8;
+layout(constant_id=25)const bool SPREAD=false;
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {
+ uint rows,input_size,out_stride,plane_input_size;
+ uint cols[3],fmt[3],offset[3];
+ uint epilogue,output_f32,row_start,active_rows,input_f32;
+};
+layout(buffer_reference,std430,buffer_reference_align=2)readonly buffer RB16 {bfloat16_t values[];};
+uint fragment_row(uint lane){return (lane&6)|((lane>>1)&8);}
+uint fragment_column(uint lane){return ((lane&1)<<2)|(lane&8);}
+shared bfloat16_t code_lut[256];
+vec2 group_coefficient(uvec4 header,uint j,float d){
+ if(FORMAT0==6||FORMAT0==2)return vec2(d,0);
+ if(FORMAT0==1){uint sc=((header.y>>(4*j))&15)|(((header.x>>(16+2*j))&3)<<4);return vec2(unpackHalf2x16(header.x).x*float(int(sc)-32),0);}
+ if(q_affine(FORMAT0)){float scale=bf16_float(uint16_t(header.x));return vec2(scale,fma(-128.0,scale,bf16_float(uint16_t(header.x>>16))));}
+ uint sc,mi;
+ if(j<4){sc=(header.y>>(8*j))&63;mi=(header.z>>(8*j))&63;}
+ else{uint shift=8*(j-4),w=header.w>>shift;sc=(w&15)|(((header.y>>(shift+6))&3)<<4);mi=((w>>4)&15)|(((header.z>>(shift+6))&3)<<4);}
+ vec2 ds=unpackHalf2x16(header.x);float scale=ds.x*float(sc);
+ return vec2(scale,fma(-128.0,scale,-ds.y*float(mi)));
+}
+#if defined(SPLASH_STATIC_FORMAT) && SPLASH_STATIC_FORMAT == 4
+void main(){
+ Params p=Params(binding_address(12));uint cpg=16*gl_NumSubgroups,tile=gl_WorkGroupID.x,t0=(p.cols[0]+cpg-1)/cpg,t1=t0+(p.cols[1]+cpg-1)/cpg;
+ uint segment=SEGMENTS==1?0:tile<t0?0:tile<t1?1:2;
+ uint column=(tile-(segment==0?0:segment==1?t0:t1))*cpg+gl_SubgroupID*16,base=gl_WorkGroupID.y*16;
+ uint lane=gl_SubgroupInvocationID,r0=column+fragment_row(lane),c0=((lane>>3)&1)|((lane&1)<<3),n0=fragment_column(lane);
+ bool valid0=FULL_COLUMNS||r0<p.cols[segment],valid1=FULL_COLUMNS||r0+1<p.cols[segment];
+ uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),meta=binding_address(3+3*segment);
+ vec4 lo=vec4(0),hi=vec4(0);uint split=gl_WorkGroupID.z,units=(INPUT_WIDTH+255)/256;
+ uint table_base=(base/16)*INPUT_WIDTH*16,sums_base=(base/16)*(INPUT_WIDTH/16*16+INPUT_WIDTH/32*16);
+ uint unitBegin=units*split/K_SPLITS,unitEnd=units*(split+1)/K_SPLITS,unitCount=unitEnd-unitBegin;
+ uint first=unitBegin+(SPREAD?(((tile*40503u)&65535u)*unitCount>>16):0);
+ for(uint walked=0;walked<unitCount;++walked){uint u=first+walked;if(u>=unitEnd)u-=unitCount;uint unit=u*256;
+  uint mt=q_tile32(r0,unit/256,PLANE_WIDTH/256);uvec4 hdr0=uvec4(0),hdr1=uvec4(0);float d0=0,d1=0;
+  if(valid0){hdr0=RU32x4(meta+mt*20).values[0];d0=q_half(meta+mt*20+16);}
+  if(valid1){hdr1=RU32x4(meta+(mt+1)*20).values[0];d1=q_half(meta+(mt+1)*20+16);}
+  [[unroll]]for(uint j=0;j<8&&unit+j*32<INPUT_WIDTH;++j){
+   uint g=unit/32+j,t=q_tile32(r0,g,PLANE_WIDTH/32);
+   uvec2 low0=uvec2(0),low1=uvec2(0);uint high0=0,high1=0;
+   if(valid0){low0=RU32x2(w0+t*16+8*(c0>>3)).values[0];high0=RU32(w1+t*8+4*(c0>>3)).values[0];}
+   if(valid1){low1=RU32x2(w0+(t+1)*16+8*(c0>>3)).values[0];high1=RU32(w1+(t+1)*8+4*(c0>>3)).values[0];}
+   uint sc0=(hdr0[j>>1]>>(16*(j&1)))&65535,sc1=(hdr1[j>>1]>>(16*(j&1)))&65535;
+   [[unroll]]for(uint h=0;h<2;++h){
+    uvec4 input_pairs=RU32x4(binding_address(13)+2*(table_base+(g*2+h)*256+lane*8)).values[0];
+    vec4 seeds=RF32x4(binding_address(14)+4*(sums_base+(g*2+h)*16+n0)).values[0];
+    MA a;MB b;MC seed;
+    [[unroll]]for(uint i=0;i<4;++i){uint parity=(lane>>3)&1,ls=4*(i&1)+16*parity+8*h,hs=2*parity+4*(i&1)+16*(i>>1)+8*h;
+     uint code0=((low0[i>>1]>>ls)&15)|(((high0>>hs)&3)<<4),code1=((low1[i>>1]>>ls)&15)|(((high1>>hs)&3)<<4);
+     // The mantissa encoding is already BF16; a numeric conversion adds
+     // rounding and NaN handling to every operand in the inner loop.
+     a[i]=uintBitsToBFloat16EXT(uint16_t(code0+0x4300u));a[i+4]=uintBitsToBFloat16EXT(uint16_t(code1+0x4300u));
+     seed[i]=seeds[i];seed[i+4]=seeds[i];
+    }
+    [[unroll]]for(uint i=0;i<8;++i)b[i]=uintBitsToBFloat16EXT(uint16_t(input_pairs[i>>1]>>(16*(i&1))));
+    MC partial=coopMatMulAdd(a,b,seed);
+    float scale0=d0*float(q_signed((sc0>>(8*h))&255)),scale1=d1*float(q_signed((sc1>>(8*h))&255));
+    lo=fma(vec4(partial[0],partial[1],partial[2],partial[3]),vec4(scale0),lo);
+    hi=fma(vec4(partial[4],partial[5],partial[6],partial[7]),vec4(scale1),hi);
+   }
+  }
+ }
+
+ uint col0=column+fragment_row(lane),row0=base+fragment_column(lane);
+ [[unroll]]for(uint i=0;i<8;++i){uint row=row0+(i&3),col=col0+(i>>2);
+  if(row>=p.rows||col>=p.cols[segment])continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=i<4?lo[i&3]:hi[i&3];
+  if(K_SPLITS>1){WF32(binding_address(15)).values[(split*p.rows+row)*OUTPUT_WIDTH+p.offset[segment]+col]=(row-base)%8<ACTIVE_ROWS?value:0.0;continue;}
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if((row-base)%8>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}
+
+#else
+void main(){
+ if(FORMAT0==6||FORMAT0==1||FORMAT0==2){
+  uint count=FORMAT0==6?256:16;
+  for(uint i=gl_LocalInvocationID.x;i<count;i+=gl_WorkGroupSize.x)code_lut[i]=bfloat16_t(FORMAT0==6?float(q_signed(i)):q_iq4(i));
+  barrier();
+ }
+ Params p=Params(binding_address(12));uint cpg=16*gl_NumSubgroups,tile=gl_WorkGroupID.x,t0=(p.cols[0]+cpg-1)/cpg,t1=t0+(p.cols[1]+cpg-1)/cpg;
+ uint segment=SEGMENTS==1?0:tile<t0?0:tile<t1?1:2;
+ uint column=(tile-(segment==0?0:segment==1?t0:t1))*cpg+gl_SubgroupID*16,base=gl_WorkGroupID.y*16;
+ const uint metaBytes=q_fields(FORMAT0).z;
+ uint lane=gl_SubgroupInvocationID,r0=column+fragment_row(lane),c0=((lane>>3)&1)|((lane&1)<<3),n0=fragment_column(lane);
+ bool valid0=FULL_COLUMNS||r0<p.cols[segment],valid1=FULL_COLUMNS||r0+1<p.cols[segment];
+ uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),meta=binding_address(3+3*segment);
+ vec4 lo=vec4(0),hi=vec4(0);uint split=gl_WorkGroupID.z,units=(INPUT_WIDTH+255)/256;
+ uint table_base=(base/16)*INPUT_WIDTH*16,sums_base=(base/16)*(INPUT_WIDTH/16*16+INPUT_WIDTH/32*16);
+ uint unitBegin=units*split/K_SPLITS,unitEnd=units*(split+1)/K_SPLITS,unitCount=unitEnd-unitBegin;
+ uint first=unitBegin+(SPREAD?(((tile*40503u)&65535u)*unitCount>>16):0);
+ for(uint walked=0;walked<unitCount;++walked){uint u=first+walked;if(u>=unitEnd)u-=unitCount;uint unit=u*256;
+  uint mt=q_tile32(r0,unit/256,PLANE_WIDTH/256);uvec4 hdr0=uvec4(0),hdr1=uvec4(0);float d0=0,d1=0;
+  if(q_meta_groups(FORMAT0)==8){
+   if(valid0){if(metaBytes>=16)hdr0=RU32x4(meta+mt*metaBytes).values[0];else hdr0.xy=RU32x2(meta+mt*metaBytes).values[0];if(FORMAT0==4)d0=q_half(meta+mt*metaBytes+16);}
+   if(valid1){if(metaBytes>=16)hdr1=RU32x4(meta+(mt+1)*metaBytes).values[0];else hdr1.xy=RU32x2(meta+(mt+1)*metaBytes).values[0];if(FORMAT0==4)d1=q_half(meta+(mt+1)*metaBytes+16);}
+  }
+  [[unroll]]for(uint j=0;j<8&&unit+j*32<INPUT_WIDTH;++j){
+   uint g=unit/32+j,t=q_tile32(r0,g,PLANE_WIDTH/32);
+   uvec4 low0=uvec4(0),low1=uvec4(0);uint high0=0,high1=0;
+   if(valid0){
+    if(FORMAT0==6)low0=RU32x4(w0+t*32+16*(c0>>3)).values[0];else low0.xy=RU32x2(w0+t*16+8*(c0>>3)).values[0];
+    if(FORMAT0==4)high0=RU32(w1+t*8+4*(c0>>3)).values[0];else if(FORMAT0==3)high0=RU32(w1+t*4).values[0];
+   }
+   if(valid1){
+    if(FORMAT0==6)low1=RU32x4(w0+(t+1)*32+16*(c0>>3)).values[0];else low1.xy=RU32x2(w0+(t+1)*16+8*(c0>>3)).values[0];
+    if(FORMAT0==4)high1=RU32(w1+(t+1)*8+4*(c0>>3)).values[0];else if(FORMAT0==3)high1=RU32(w1+(t+1)*4).values[0];
+   }
+   if(FORMAT0==6||FORMAT0==2){d0=valid0?q_half(meta+t*2):0;d1=valid1?q_half(meta+(t+1)*2):0;}
+   if(q_affine(FORMAT0)){
+    uint mg=q_meta_groups(FORMAT0),m0=q_tile32(r0,g/mg,PLANE_WIDTH/32/mg);
+    hdr0.x=valid0?RU32(meta+m0*4).values[0]:0;hdr1.x=valid1?RU32(meta+(m0+1)*4).values[0]:0;
+   }
+   uint sc0=(hdr0[j>>1]>>(16*(j&1)))&65535,sc1=(hdr1[j>>1]>>(16*(j&1)))&65535;
+   MC partial=MC(0.0);
+   [[unroll]]for(uint h=0;h<2;++h){
+    uvec4 input_pairs=RU32x4(binding_address(13)+2*(table_base+(g*2+h)*256+lane*8)).values[0];
+    vec4 seeds=vec4(0);if(FORMAT0==4)seeds=RF32x4(binding_address(14)+4*(sums_base+(g*2+h)*16+n0)).values[0];
+    MA a;MB b;
+    [[unroll]]for(uint i=0;i<4;++i){uint parity=(lane>>3)&1,ls=4*(i&1)+16*parity+8*h,hs=2*parity+4*(i&1)+16*(i>>1)+8*h;
+     uint code0,code1;
+     if(FORMAT0==6){uint word=2*(i>>1)+h,shift=16*(i&1)+8*parity;code0=(low0[word]>>shift)&255;code1=(low1[word]>>shift)&255;}
+     else if(FORMAT0==1||FORMAT0==2){uint shift=8*(i&1)+4*parity+16*h;code0=(low0[i>>1]>>shift)&15;code1=(low1[i>>1]>>shift)&15;}
+     else{code0=(low0[i>>1]>>ls)&15;code1=(low1[i>>1]>>ls)&15;}
+     if(FORMAT0==4){code0|=((high0>>hs)&3)<<4;code1|=((high1>>hs)&3)<<4;}
+     else if(FORMAT0==3){uint slot=16*(c0>>3)+8*(i>>1)+2*(i&1)+parity+4*h;code0|=((high0>>slot)&1)<<4;code1|=((high1>>slot)&1)<<4;}
+     if(FORMAT0==6||FORMAT0==1||FORMAT0==2){a[i]=code_lut[code0];a[i+4]=code_lut[code1];}
+     else{a[i]=uintBitsToBFloat16EXT(uint16_t(code0+0x4300u));a[i+4]=uintBitsToBFloat16EXT(uint16_t(code1+0x4300u));}
+     if(FORMAT0==4){partial[i]=seeds[i];partial[i+4]=seeds[i];}
+    }
+    [[unroll]]for(uint i=0;i<8;++i)b[i]=uintBitsToBFloat16EXT(uint16_t(input_pairs[i>>1]>>(16*(i&1))));
+    partial=coopMatMulAdd(a,b,partial);
+    if(FORMAT0==4){
+     float scale0=d0*float(q_signed((sc0>>(8*h))&255)),scale1=d1*float(q_signed((sc1>>(8*h))&255));
+     lo=fma(vec4(partial[0],partial[1],partial[2],partial[3]),vec4(scale0),lo);
+     hi=fma(vec4(partial[4],partial[5],partial[6],partial[7]),vec4(scale1),hi);
+    }
+   }
+   if(FORMAT0!=4){
+    vec2 coef0=group_coefficient(hdr0,j,d0),coef1=group_coefficient(hdr1,j,d1);
+    lo=fma(vec4(partial[0],partial[1],partial[2],partial[3]),vec4(coef0.x),lo);
+    hi=fma(vec4(partial[4],partial[5],partial[6],partial[7]),vec4(coef1.x),hi);
+    if(FORMAT0==0||FORMAT0==3||q_affine(FORMAT0)){
+     vec4 sums=RF32x4(binding_address(14)+4*(sums_base+INPUT_WIDTH/16*16+g*16+n0)).values[0];
+     lo=fma(sums,vec4(coef0.y),lo);hi=fma(sums,vec4(coef1.y),hi);
+    }
+   }
+  }
+ }
+
+ uint col0=column+fragment_row(lane),row0=base+fragment_column(lane);
+ [[unroll]]for(uint i=0;i<8;++i){uint row=row0+(i&3),col=col0+(i>>2);
+  if(row>=p.rows||col>=p.cols[segment])continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=i<4?lo[i&3]:hi[i&3];
+  if(K_SPLITS>1){WF32(binding_address(15)).values[(split*p.rows+row)*OUTPUT_WIDTH+p.offset[segment]+col]=(row-base)%8<ACTIVE_ROWS?value:0.0;continue;}
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if((row-base)%8>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}
+
+#endif

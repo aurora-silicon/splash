@@ -1,0 +1,309 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+#define SPLASH_LOCAL_SIZE_DEFAULT 128
+#include "common.glsl"
+#include "quant.glsl"
+
+layout(constant_id = 3) const uint FORMAT0 = 0;
+layout(constant_id = 4) const uint FORMAT1 = 0;
+layout(constant_id = 5) const uint FORMAT2 = 0;
+layout(constant_id = 6) const uint EPILOGUE = 0;
+layout(constant_id = 7) const bool OUTPUT_F32 = false;
+layout(constant_id = 8) const uint INPUT_WIDTH = 0;
+layout(constant_id = 9) const uint PLANE_WIDTH = 0;
+layout(constant_id = 10) const uint OUTPUT_WIDTH = 0;
+layout(constant_id = 11) const bool FULL_ROWS = false;
+layout(constant_id = 12) const uint SEGMENTS = 1;
+layout(constant_id = 13) const bool FULL_COLUMNS = false;
+layout(constant_id=14) const bool ALIGNED_INPUT=true;
+layout(constant_id=15) const uint K_SPLITS=1;
+layout(constant_id=16) const bool SHARED_ACCUMULATORS=false;
+layout(constant_id=17)const bool FOUR_CHAINS=false;
+layout(constant_id=18)const uint ACTIVE_ROWS=8;
+layout(constant_id=19)const bool INPUT_F32=false;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Params {
+    uint rows;
+    uint input_size;
+    uint out_stride;
+    uint plane_input_size;
+    uint cols[3];
+    uint fmt[3];
+    uint offset[3];
+    uint epilogue;
+    uint output_f32;
+    uint row_start;
+    uint active_rows;
+    uint input_f32;
+};
+float weight_at(uint segment, uint row, uint column) {
+    if (SEGMENTS == 1 || segment == 0) return q_value(FORMAT0, binding_address(1), binding_address(2), binding_address(3), row, column, PLANE_WIDTH);
+    if (segment == 1) return q_value(FORMAT1, binding_address(4), binding_address(5), binding_address(6), row, column, PLANE_WIDTH);
+    return q_value(FORMAT2, binding_address(7), binding_address(8), binding_address(9), row, column, PLANE_WIDTH);
+}
+
+
+
+const uint WG_SUBGROUPS=gl_WorkGroupSize.x/32;
+layout(constant_id=20)const uint BLOCK_CAP=32;
+layout(constant_id=21)const bool DIRECT_LAYOUT=false;
+layout(constant_id=22)const uint N_TILE=8;
+shared float16_t a_tile[WG_SUBGROUPS*8*BLOCK_CAP],b_tile[WG_SUBGROUPS*8*BLOCK_CAP];
+shared float scales[WG_SUBGROUPS*8],biases[WG_SUBGROUPS*8],row_sums[WG_SUBGROUPS*8],output_tile[WG_SUBGROUPS*64];
+void sg_barrier(){controlBarrier(gl_ScopeSubgroup,gl_ScopeSubgroup,gl_StorageSemanticsShared,gl_SemanticsAcquireRelease);}
+vec2 coefficient(uint f,uint64_t metadata,uint row,uint k){
+ if(f==42)return vec2(1,0);
+ uint g=k/32,mg=q_meta_groups(f),j=g%mg,e=k%32;
+ uint64_t m=metadata+q_tile32(row,g/mg,(PLANE_WIDTH/32)/mg)*q_fields(f).z;
+ if(q_affine(f))return vec2(bf16_float(R16(m).values[0]),bf16_float(R16(m+2).values[0]));
+ if(f==4)return vec2(q_half(m+16)*float(q_signed(q_byte(m,2*j+e/16))),0);
+ if(f==6||f==2)return vec2(q_half(m),0);
+ if(f==1){uint lo=(q_byte(m,4+j/2)>>(4*(j&1)))&15,hi=(uint(R16(m+2).values[0])>>(2*j))&3;return vec2(q_half(m)*float(int(lo|(hi<<4))-32),0);}
+ uint sc,mi;if(j<4){sc=q_byte(m,4+j)&63;mi=q_byte(m,8+j)&63;}else{sc=(q_byte(m,8+j)&15)|((q_byte(m,j)>>6)<<4);mi=(q_byte(m,8+j)>>4)|((q_byte(m,4+j)>>6)<<4);}
+ return vec2(q_half(m)*float(sc),-q_half(m+2)*float(mi));
+}
+float code_value(uint f,uint code){if(f==4)return float(int(code)-32);if(f==6)return float(q_signed(code));if(f==1||f==2)return q_iq4(code);if(f==42)return unpackHalf2x16(code).x;return float(code);}
+
+// Honeykrisp's native AGX3 8x8 fragment map, qualified for A/B/C at backend
+// creation. Codes stay exact integers in FP16; original Q6 scales stay FP32.
+void direct_q6_single(Params p,uint segment,uint column,uint base){
+ uint lane=gl_SubgroupInvocationID;
+ uint m=((lane>>1)&3)|((lane>>2)&4),n=((lane&1)<<1)|((lane>>1)&4);
+ uint row0=column+n,row1=row0+1;bool valid0=FULL_COLUMNS||row0<p.cols[segment],valid1=FULL_COLUMNS||row1<p.cols[segment];
+ uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),metadata=binding_address(3+3*segment);
+ coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>total=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+ for(uint begin=0;begin<INPUT_WIDTH;begin+=32){
+  uint g=begin/32,j=g%8;uint t=q_tile32(row0,g,PLANE_WIDTH/32);
+  uvec4 l0=uvec4(0),l1=uvec4(0),high=uvec4(0);
+  if(valid0)l0=RU32x4(w0+t*16).values[0];
+  if(valid1)l1=RU32x4(w0+(t+1)*16).values[0];
+  if(valid0&&valid1)high=RU32x4(w1+t*8).values[0];
+  else if(valid0)high.xy=RU32x2(w1+t*8).values[0];
+  uint mt=q_tile32(row0,g/8,(PLANE_WIDTH/32)/8);
+  float d0=valid0?q_half(metadata+mt*20+16):0,d1=valid1?q_half(metadata+(mt+1)*20+16):0;
+  uint sc0=valid0?uint(R16(metadata+mt*20+2*j).values[0]):0,sc1=valid1?uint(R16(metadata+(mt+1)*20+2*j).values[0]):0;
+  [[unroll]]for(uint half_block=0;half_block<2;++half_block){
+   coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>partial=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+   [[unroll]]for(uint step=0;step<2;++step){
+    coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseA>a;
+    coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseB>b;
+    uint input_pair=0;uint64_t address=binding_address(0)+2*((base+m+p.row_start)*INPUT_WIDTH+begin+half_block*16+step*8+n);
+    if((FULL_ROWS||base+m<p.rows)&&m<ACTIVE_ROWS){if(ALIGNED_INPUT)input_pair=RU32(address).values[0];else input_pair=uint(R16(address).values[0])|(uint(R16(address+2).values[0])<<16);}
+    a[0]=float16_t(uintBitsToFloat(input_pair<<16));a[1]=float16_t(uintBitsToFloat(input_pair&0xffff0000u));
+    uint word=(m>>2)+2*step,shift=8*half_block+4*((m&3)>>1)+16*(m&1),slot=8*word+4*half_block+(m&3);
+    uint code0=((l0[word]>>shift)&15)|(((high[step]>>(2*(slot%16)))&3)<<4);
+    uint code1=((l1[word]>>shift)&15)|(((high[step+2]>>(2*(slot%16)))&3)<<4);
+    b[0]=valid0?float16_t(int(code0)-32):float16_t(0);b[1]=valid1?float16_t(int(code1)-32):float16_t(0);
+    partial=coopMatMulAdd(a,b,partial);
+   }
+   float scale0=d0*float(q_signed((sc0>>(8*half_block))&255)),scale1=d1*float(q_signed((sc1>>(8*half_block))&255));
+   total[0]=fma(partial[0],scale0,total[0]);total[1]=fma(partial[1],scale1,total[1]);
+  }
+ }
+ uint row=base+m;
+ [[unroll]]for(uint i=0;i<2;++i){uint col=column+n+i;if(row>=p.rows||col>=p.cols[segment])continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=total[i];
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if(m>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}
+
+void direct_q6(Params p,uint segment,uint column,uint base){
+ uint lane=gl_SubgroupInvocationID,m=((lane>>1)&3)|((lane>>2)&4),n=((lane&1)<<1)|((lane>>1)&4);
+ uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),metadata=binding_address(3+3*segment);
+ coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>totals[2];
+ [[unroll]]for(uint part=0;part<N_TILE/8;++part)totals[part]=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+ for(uint begin=0;begin<INPUT_WIDTH;begin+=32){
+  uint g=begin/32,j=g%8;
+  uvec4 lows0[2],lows1[2],highs[2];uint scales0[2],scales1[2];float d0[2],d1[2];bool valid0[2],valid1[2];
+  [[unroll]]for(uint part=0;part<N_TILE/8;++part){uint row0=column+part*8+n,row1=row0+1;valid0[part]=FULL_COLUMNS||row0<p.cols[segment];valid1[part]=FULL_COLUMNS||row1<p.cols[segment];
+   uint t=q_tile32(row0,g,PLANE_WIDTH/32),mt=q_tile32(row0,g/8,(PLANE_WIDTH/32)/8);
+   lows0[part]=uvec4(0);lows1[part]=uvec4(0);highs[part]=uvec4(0);
+   if(valid0[part])lows0[part]=RU32x4(w0+t*16).values[0];if(valid1[part])lows1[part]=RU32x4(w0+(t+1)*16).values[0];
+   if(valid0[part]&&valid1[part])highs[part]=RU32x4(w1+t*8).values[0];else if(valid0[part])highs[part].xy=RU32x2(w1+t*8).values[0];
+   d0[part]=valid0[part]?q_half(metadata+mt*20+16):0;d1[part]=valid1[part]?q_half(metadata+(mt+1)*20+16):0;
+   scales0[part]=valid0[part]?uint(R16(metadata+mt*20+2*j).values[0]):0;scales1[part]=valid1[part]?uint(R16(metadata+(mt+1)*20+2*j).values[0]):0;
+  }
+  [[unroll]]for(uint half_block=0;half_block<2;++half_block){
+   coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>partials[2];
+   [[unroll]]for(uint part=0;part<N_TILE/8;++part)partials[part]=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+   [[unroll]]for(uint step=0;step<2;++step){
+    coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseA>a;
+    uint input_pair=0;uint64_t address=binding_address(0)+2*((base+m+p.row_start)*INPUT_WIDTH+begin+half_block*16+step*8+n);
+    if((FULL_ROWS||base+m<p.rows)&&m<ACTIVE_ROWS){if(ALIGNED_INPUT)input_pair=RU32(address).values[0];else input_pair=uint(R16(address).values[0])|(uint(R16(address+2).values[0])<<16);}
+    a[0]=float16_t(uintBitsToFloat(input_pair<<16));a[1]=float16_t(uintBitsToFloat(input_pair&0xffff0000u));
+    uint word=(m>>2)+2*step,shift=8*half_block+4*((m&3)>>1)+16*(m&1),slot=8*word+4*half_block+(m&3);
+    [[unroll]]for(uint part=0;part<N_TILE/8;++part){coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseB>b;
+     uint code0=((lows0[part][word]>>shift)&15)|(((highs[part][step]>>(2*(slot%16)))&3)<<4);
+     uint code1=((lows1[part][word]>>shift)&15)|(((highs[part][step+2]>>(2*(slot%16)))&3)<<4);
+     b[0]=valid0[part]?float16_t(int(code0)-32):float16_t(0);b[1]=valid1[part]?float16_t(int(code1)-32):float16_t(0);
+     partials[part]=coopMatMulAdd(a,b,partials[part]);
+    }
+   }
+   [[unroll]]for(uint part=0;part<N_TILE/8;++part){float sc0=d0[part]*float(q_signed((scales0[part]>>(8*half_block))&255)),sc1=d1[part]*float(q_signed((scales1[part]>>(8*half_block))&255));totals[part][0]=fma(partials[part][0],sc0,totals[part][0]);totals[part][1]=fma(partials[part][1],sc1,totals[part][1]);}
+  }
+ }
+ uint row=base+m;
+ [[unroll]]for(uint part=0;part<N_TILE/8;++part)[[unroll]]for(uint i=0;i<2;++i){uint col=column+part*8+n+i;if(row>=p.rows||col>=p.cols[segment])continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=totals[part][i];
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if(m>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}
+
+void direct_quant(Params p,uint f,uint segment,uint column,uint base){
+ uint lane=gl_SubgroupInvocationID,m=((lane>>1)&3)|((lane>>2)&4),n=((lane&1)<<1)|((lane>>1)&4);
+ uint row0=column+n,row1=row0+1;bool valid0=FULL_COLUMNS||row0<p.cols[segment],valid1=FULL_COLUMNS||row1<p.cols[segment];
+ bool packed=f==0||f==1||f==2||f==3||(q_affine(f)&&q_bits(f)==4),has_bias=f==0||f==3||q_affine(f);
+ uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),metadata=binding_address(3+3*segment);
+ coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>total=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+ for(uint begin=0;begin<INPUT_WIDTH;begin+=32){
+  uint t=q_tile32(row0,begin/32,PLANE_WIDTH/32);
+  uvec4 l0=uvec4(0),l1=uvec4(0),l2=uvec4(0),l3=uvec4(0);uvec2 high=uvec2(0);
+  if(packed){if(valid0)l0=RU32x4(w0+t*16).values[0];if(valid1)l1=RU32x4(w0+(t+1)*16).values[0];
+   if(f==3){if(valid0&&valid1)high=RU32x2(w1+t*4).values[0];else if(valid0)high.x=RU32(w1+t*4).values[0];}
+  }else if(f==6){if(valid0){l0=RU32x4(w0+t*32).values[0];l2=RU32x4(w0+t*32+16).values[0];}if(valid1){l1=RU32x4(w0+(t+1)*32).values[0];l3=RU32x4(w0+(t+1)*32+16).values[0];}}
+  vec2 c0=valid0?coefficient(f,metadata,row0,begin):vec2(0),c1=valid1?coefficient(f,metadata,row1,begin):vec2(0);
+  coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>partial=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+  float input_sum=0;
+  [[unroll]]for(uint step=0;step<4;++step){
+   coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseA>a;
+   coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseB>b;
+   uint input_pair=0;uint64_t address=binding_address(0)+2*((base+m+p.row_start)*INPUT_WIDTH+begin+step*8+n);
+   if((FULL_ROWS||base+m<p.rows)&&m<ACTIVE_ROWS){if(ALIGNED_INPUT)input_pair=RU32(address).values[0];else input_pair=uint(R16(address).values[0])|(uint(R16(address+2).values[0])<<16);}
+   float16_t a0=float16_t(uintBitsToFloat(input_pair<<16)),a1=float16_t(uintBitsToFloat(input_pair&0xffff0000u));a[0]=a0;a[1]=a1;
+   if(has_bias)input_sum+=float(a0)+float(a1);
+   float v0=0,v1=0;
+   if(packed){uint e=step*8+m,word=(m>>2)+2*(step&1),slot=8*word+4*(step/2)+(m&3);
+    uint shift=(f==1||f==2)?16*(step/2)+4*(m&3):8*(step/2)+4*((m&3)>>1)+16*(m&1);
+    uint code0=(l0[word]>>shift)&15,code1=(l1[word]>>shift)&15;
+    if(f==3){code0|=((high.x>>slot)&1)<<4;code1|=((high.y>>slot)&1)<<4;}
+    v0=(f==1||f==2)?q_iq4(code0):float(code0);v1=(f==1||f==2)?q_iq4(code1):float(code1);
+   }else if(f==6){uint word=2*((m>>2)+2*(step&1))+step/2,shift=8*(m&3);
+    uint code0=((word<4?l0[word&3]:l2[word&3])>>shift)&255,code1=((word<4?l1[word&3]:l3[word&3])>>shift)&255;
+    v0=float(q_signed(code0));v1=float(q_signed(code1));
+   }else{if(valid0)v0=code_value(f,q_code(f,w0,w1,row0,begin+step*8+m,PLANE_WIDTH));if(valid1)v1=code_value(f,q_code(f,w0,w1,row1,begin+step*8+m,PLANE_WIDTH));}
+   b[0]=valid0?float16_t(v0):float16_t(0);b[1]=valid1?float16_t(v1):float16_t(0);
+   partial=coopMatMulAdd(a,b,partial);
+  }
+  total[0]=fma(partial[0],c0.x,total[0]);total[1]=fma(partial[1],c1.x,total[1]);
+  if(has_bias){input_sum+=subgroupShuffleXor(input_sum,1);input_sum+=subgroupShuffleXor(input_sum,8);total[0]=fma(input_sum,c0.y,total[0]);total[1]=fma(input_sum,c1.y,total[1]);}
+ }
+ uint row=base+m;
+ [[unroll]]for(uint i=0;i<2;++i){uint col=column+n+i;if(row>=p.rows||col>=p.cols[segment])continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=total[i];
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if(m>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}
+void main(){
+ Params p=Params(binding_address(12));uint lane=gl_SubgroupInvocationID,tile=gl_WorkGroupID.x,cpg=N_TILE*(gl_WorkGroupSize.x/32),t0=(p.cols[0]+cpg-1)/cpg,t1=t0+(p.cols[1]+cpg-1)/cpg;
+ uint segment=SEGMENTS==1?0:tile<t0?0:tile<t1?1:2;
+ uint column=(tile-(segment==0?0:segment==1?t0:t1))*cpg+gl_SubgroupID*N_TILE,base=gl_WorkGroupID.y*8;
+ uint ab=gl_SubgroupID*8*BLOCK_CAP,cb=gl_SubgroupID*8,ob=gl_SubgroupID*64;
+ if(column>=p.cols[segment])return;
+ uint f=segment==0?FORMAT0:segment==1?FORMAT1:FORMAT2;
+ if(DIRECT_LAYOUT&&f==4){if(N_TILE==8)direct_q6_single(p,segment,column,base);else direct_q6(p,segment,column,base);return;}
+ if(DIRECT_LAYOUT&&f!=4&&f!=41&&f!=0xffffffffu){direct_quant(p,f,segment,column,base);return;}
+ if(f==0xffffffffu||f==41){
+  uint mr=lane/4,pair=lane%4,col=column+2*pair;vec2 acc=vec2(0);
+  for(uint begin=0;begin<INPUT_WIDTH;begin+=8){uint k=begin+mr,r=base+2*pair;float a0=0,a1=0;
+   if(r<p.rows&&2*pair<ACTIVE_ROWS)a0=bf16_float(R16(binding_address(0)+2*(uint64_t(r+p.row_start)*INPUT_WIDTH+k)).values[0]);
+   if(r+1<p.rows&&2*pair+1<ACTIVE_ROWS)a1=bf16_float(R16(binding_address(0)+2*(uint64_t(r+1+p.row_start)*INPUT_WIDTH+k)).values[0]);
+   float b0=col<p.cols[segment]?weight_at(segment,col,k):0,b1=col+1<p.cols[segment]?weight_at(segment,col+1,k):0;
+   [[unroll]]for(uint i=0;i<8;++i){uint fa=4*i+mr/2,fb=4*i+pair;float x0=subgroupShuffle(a0,fa),x1=subgroupShuffle(a1,fa);float x=(mr&1)==0?x0:x1;acc.x=fma(x,subgroupShuffle(b0,fb),acc.x);acc.y=fma(x,subgroupShuffle(b1,fb),acc.y);}
+  }
+  output_tile[ob+mr*8+2*pair]=acc.x;output_tile[ob+mr*8+2*pair+1]=acc.y;sg_barrier();
+ }else{
+  coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator> accumulated=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+  uint block_size=f==4?16:32;
+  bool has_bias=f==0||f==3||q_affine(f);
+  uint64_t w0=binding_address(1+3*segment),w1=binding_address(2+3*segment),meta=binding_address(3+3*segment);
+  for(uint begin=0;begin<INPUT_WIDTH;begin+=block_size){
+   // Each lane loads four/eight adjacent BF16 activations in vector
+   // transactions, rather than gathering one half from every token row.
+   uint input_row=lane/4,input_chunk=lane%4,values_per_lane=block_size/4;
+   uvec4 words=uvec4(0);
+   if((FULL_ROWS||base+input_row<p.rows)&&input_row<ACTIVE_ROWS){
+    uint64_t address=binding_address(0)+2*(uint64_t(base+input_row+p.row_start)*INPUT_WIDTH+begin+input_chunk*values_per_lane);
+    if(ALIGNED_INPUT){words.xy=RU32x2(address).values[0];if(block_size==32)words.zw=RU32x2(address+8).values[0];}
+    else{[[unroll]]for(uint j=0;j<8;++j)if(j<values_per_lane)words[j/2]|=uint(R16(address+2*j).values[0])<<(16*(j&1));}
+   }
+   float local_sum=0;
+   [[unroll]]for(uint j=0;j<8;++j)if(j<values_per_lane){
+    float16_t h=float16_t(bf16_float(uint16_t(words[j/2]>>(16*(j&1)))));
+    a_tile[ab+input_row*block_size+input_chunk*values_per_lane+j]=h;
+    if(has_bias)local_sum+=float(h);
+   }
+   if(has_bias){local_sum+=subgroupShuffleXor(local_sum,1);local_sum+=subgroupShuffleXor(local_sum,2);if(input_chunk==0)row_sums[cb+input_row]=local_sum;}
+   uint n=lane%8,word=lane/8;
+   bool valid_column=FULL_COLUMNS||column+n<p.cols[segment];
+   if(f==4){
+    uint g=begin/32,h=(begin%32)/16;uint t=q_tile32(column+n,g,PLANE_WIDTH/32);
+    uint lo=valid_column?RU32(w0+t*16+4*word).values[0]:0;
+    uint hi=valid_column?RU32(w1+t*8+4*(word/2)).values[0]:0;
+    [[unroll]]for(uint j=0;j<4;++j){uint slot=8*word+4*h+j;
+      uint code=((lo>>(8*h+4*(j/2)+16*(j&1)))&15)|(((hi>>(2*(slot%16)))&3)<<4);
+      b_tile[ab+(4*word+j)*8+n]=valid_column?float16_t(int(code)-32):float16_t(0);
+    }
+   }else if(f==0||f==1||f==2||f==3||(q_affine(f)&&q_bits(f)==4)){
+    uint t=q_tile32(column+n,begin/32,PLANE_WIDTH/32);
+    uint lo=valid_column?RU32(w0+t*16+4*word).values[0]:0;
+    uint hi=f==3&&valid_column?RU32(w1+t*4).values[0]:0;
+    [[unroll]]for(uint pair=0;pair<4;++pair)[[unroll]]for(uint parity=0;parity<2;++parity){
+      uint e=4*word+16*(pair/2)+2*(pair%2)+parity,slot=8*word+2*pair+parity;
+      uint code=(lo>>((f==1||f==2)?8*pair+4*parity:4*pair+16*parity))&15;
+      if(f==3)code|=((hi>>slot)&1)<<4;
+      b_tile[ab+e*8+n]=valid_column?float16_t((f==1||f==2)?q_iq4(code):float(code)):float16_t(0);
+    }
+   }else if(f==6){
+    uint t=q_tile32(column+n,begin/32,PLANE_WIDTH/32);
+    [[unroll]]for(uint part=0;part<2;++part){uint wi=2*word+part;
+      uint packed=valid_column?RU32(w0+t*32+4*wi).values[0]:0;
+      [[unroll]]for(uint j=0;j<4;++j){uint e=4*(wi/2)+16*(wi&1)+j;b_tile[ab+e*8+n]=float16_t(q_signed((packed>>(8*j))&255));}
+    }
+   }else{
+    for(uint i=lane;i<8*block_size;i+=32){uint k=i/8,col=i%8;float v=column+col<p.cols[segment]?code_value(f,q_code(f,w0,w1,column+col,begin+k,PLANE_WIDTH)):0;b_tile[ab+i]=float16_t(v);}
+   }
+   if(lane<8){vec2 c=column+lane<p.cols[segment]?coefficient(f,meta,column+lane,begin):vec2(0);scales[cb+lane]=c.x;biases[cb+lane]=c.y;}
+   sg_barrier();
+   coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator> partial=coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator>(0.0);
+   [[unroll]]for(uint k=0;k<block_size;k+=8){
+    coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseA> a;
+    coopmat<float16_t,gl_ScopeSubgroup,8,8,gl_MatrixUseB> b;
+    coopMatLoad(a,a_tile,ab+k,block_size,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b,b_tile,ab+k*8,8,gl_CooperativeMatrixLayoutRowMajor);
+    partial=coopMatMulAdd(a,b,partial);
+   }
+   coopmat<float,gl_ScopeSubgroup,8,8,gl_MatrixUseAccumulator> scale_matrix,bias_matrix,sum_matrix;
+   coopMatLoad(scale_matrix,scales,cb,0,gl_CooperativeMatrixLayoutRowMajor);
+   accumulated=accumulated+partial*scale_matrix;
+   if(has_bias){coopMatLoad(bias_matrix,biases,cb,0,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(sum_matrix,row_sums,cb,0,gl_CooperativeMatrixLayoutColumnMajor);
+    accumulated=accumulated+sum_matrix*bias_matrix;
+   }
+   sg_barrier();
+  }
+  coopMatStore(accumulated,output_tile,ob,8,gl_CooperativeMatrixLayoutRowMajor);sg_barrier();
+ }
+ for(uint i=lane;i<64;i+=32){uint row=base+i/8,col=column+i%8;if(row>=p.rows||col>=p.cols[segment])continue;
+  uint index=(row+p.row_start)*OUTPUT_WIDTH+p.offset[segment]+col;float value=output_tile[ob+i];
+  if(EPILOGUE==1)value+=bf16_float(R16(binding_address(11)+2*index).values[0]);
+  if(EPILOGUE==2){float gate=bf16_float(R16(binding_address(11)+2*index).values[0]);value=bf16_float(float_bf16(value))*(gate/(1.0+exp2(-1.44269504089*gate)));}
+  if(i/8>=ACTIVE_ROWS)value=0;
+  if(OUTPUT_F32)WF32(binding_address(10)+4*index).values[0]=value;else W16(binding_address(10)+2*index).values[0]=float_bf16(value);
+ }
+}

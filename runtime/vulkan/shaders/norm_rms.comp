@@ -1,0 +1,144 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#include "common.glsl"
+
+layout(constant_id = 3) const bool WEIGHT_F32 = false;
+layout(constant_id = 4) const bool STAGED = false;
+layout(constant_id = 5) const bool EMIT_TABLE16 = false;
+layout(constant_id = 6) const uint INPUT_WIDTH = 0;
+shared float partials[32];
+shared uint16_t stage[2048];
+
+float weight_at(uint column) {
+    return WEIGHT_F32 ? RF32(binding_address(1)).values[column]
+                      : bf16_float(R16(binding_address(1)).values[column]);
+}
+
+uint table_offset(uint j, uint kp, uint row) {
+    return (((j >> 2) * 8 + kp) * 4 + (row >> 1)) * 8 + (j & 3) * 2 + (row & 1);
+}
+
+void write_table(uint width, uint row, uint span, uint lane, uint16_t a, uint16_t b) {
+    uint k = 2 * lane;
+    uint q = k >> 5, h = (k >> 4) & 1, v = (k >> 2) & 3, n = (k >> 1) & 1;
+    uint j = 4 * q + 2 * h + n, kp = 2 * v;
+    uint64_t base = uint64_t(row / 8) * width * 8 + span * 512;
+    uint r = row % 8;
+    W16(binding_address(3) + 2 * (base + table_offset(j, kp, r))).values[0] = a;
+    W16(binding_address(3) + 2 * (base + table_offset(j, kp + 1, r))).values[0] = b;
+    precise float s = bf16_float(a) + bf16_float(b);
+    s += subgroupShuffleXor(s, 1);
+    s += subgroupShuffleXor(s, 2);
+    s += subgroupShuffleXor(s, 4);
+    uint64_t sums_base = uint64_t(row / 8) * (width / 16 * 8 + width / 32 * 8);
+    if ((lane & 7) == 0)
+        WF32(binding_address(4) + 4 * (sums_base + (span * 4 + lane / 8) * 8 + r)).values[0] = -160.0 * s;
+    precise float s32 = s + subgroupShuffleXor(s, 8);
+    if ((lane & 15) == 0)
+        WF32(binding_address(4) + 4 * (sums_base + width / 16 * 8 + (span * 2 + lane / 16) * 8 + r)).values[0] = s32;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg = gl_SubgroupID;
+    uint row = gl_WorkGroupID.x;
+    uint width = INPUT_WIDTH != 0 ? INPUT_WIDTH : RU32(binding_address(EMIT_TABLE16 ? 5 : 3)).values[0];
+    R16 input_row = R16(binding_address(0) + uint64_t(row) * width * 2);
+    W16 output_row = W16(binding_address(2) + uint64_t(row) * width * 2);
+    uint16_t first_x[32];
+    float first_w[32];
+    uint16_t pairs[32];
+    float pair_weights[32];
+    precise float sum = 0.0;
+
+    if (STAGED) {
+        for (uint c = tid; c < width; c += gl_WorkGroupSize.x) stage[c] = input_row.values[c];
+        barrier();
+        if (tid < 256) {
+            for (uint c = tid; c < width; c += 256) {
+                float v = bf16_float(stage[c]);
+                sum += v * v;
+            }
+        }
+    } else if (width > 2048) {
+        [[unroll]] for (uint i = 0; i < 32; ++i) {
+            uint c = tid + 256 * i;
+            first_x[i] = c < width ? input_row.values[c] : uint16_t(0);
+            first_w[i] = !EMIT_TABLE16 && c < width ? weight_at(c) : 0.0;
+        }
+        [[unroll]] for (uint i = 0; i < 32; ++i) {
+            float v = bf16_float(first_x[i]);
+            sum += v * v;
+        }
+        for (uint c = tid + 8192; c < width; c += 256) {
+            float v = bf16_float(input_row.values[c]);
+            sum += v * v;
+        }
+    } else {
+        for (uint c = tid; c < width; c += 256) {
+            float v = bf16_float(input_row.values[c]);
+            sum += v * v;
+        }
+    }
+
+    if (EMIT_TABLE16) {
+        [[unroll]] for (uint j = 0; j < 16; ++j) {
+            uint c = (sg + 8 * j) * 64 + 2 * lane;
+            pairs[2*j] = c < width ? input_row.values[c] : uint16_t(0);
+            pairs[2*j+1] = c + 1 < width ? input_row.values[c+1] : uint16_t(0);
+            pair_weights[2*j] = c < width ? weight_at(c) : 0.0;
+            pair_weights[2*j+1] = c + 1 < width ? weight_at(c+1) : 0.0;
+        }
+    }
+
+    float reduced = subgroupAdd(sum);
+    if (lane == 0) partials[sg] = reduced;
+    barrier();
+    if (tid == 0) {
+        precise float total = 0.0;
+        for (uint i = 0; i < 8; ++i) total += partials[i];
+        partials[0] = inversesqrt(total / width + 1e-6);
+    }
+    barrier();
+    float inverse = partials[0];
+
+    if (EMIT_TABLE16) {
+        for (uint begin = 0; begin < width; begin += 8192) {
+          [[unroll]] for (uint j = 0; j < 16; ++j) {
+            uint c = begin + (sg + 8 * j) * 64 + lane * 2;
+            if (c >= width) continue;
+            float a = bf16_float(begin == 0 ? pairs[2*j] : input_row.values[c]);
+            float b = bf16_float(begin == 0 ? pairs[2*j+1] : input_row.values[c+1]);
+            float wa = begin == 0 ? pair_weights[2*j] : weight_at(c);
+            float wb = begin == 0 ? pair_weights[2*j+1] : weight_at(c+1);
+            precise float ya = (a * inverse) * wa;
+            precise float yb = (b * inverse) * wb;
+            uint16_t qa = float_bf16(ya), qb = float_bf16(yb);
+            output_row.values[c] = qa;
+            output_row.values[c+1] = qb;
+            write_table(width, row, c / 64, lane, qa, qb);
+          }
+        }
+    } else if (!STAGED && width > 2048) {
+        for (uint begin = 0; begin < width; begin += 8192) {
+            [[unroll]] for (uint i = 0; i < 32; ++i) {
+                uint c = begin + tid + 256 * i;
+                if (c >= width) continue;
+                float x = bf16_float(begin == 0 ? first_x[i] : input_row.values[c]);
+                float w = begin == 0 ? first_w[i] : weight_at(c);
+                precise float y = (x * inverse) * w;
+                output_row.values[c] = float_bf16(y);
+            }
+        }
+    } else {
+        for (uint c = tid; c < width; c += gl_WorkGroupSize.x) {
+            float x = bf16_float(STAGED ? stage[c] : input_row.values[c]);
+            precise float y = (x * inverse) * weight_at(c);
+            output_row.values[c] = float_bf16(y);
+        }
+    }
+}

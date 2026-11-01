@@ -1,0 +1,101 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_bfloat16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#pragma use_vulkan_memory_model
+#include "common.glsl"
+#include "attention_common.glsl"
+// One KV page per split; the host retains scalar attention for longer splits.
+// Same page loop and BF16 probabilities as upstream paged_attention_tile.h:
+// QK -> shared scores -> four-lane row softmax -> PV, three barriers/page.
+#define MA coopmat<bfloat16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA>
+#define MB coopmat<bfloat16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB>
+#define MC coopmat<float,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>
+layout(buffer_reference,std430,buffer_reference_align=2) readonly buffer RB16 {bfloat16_t values[];};
+const uint GROUP=QH/KH;
+const uint M=8*GROUP;
+const uint FRAGMENTS=M/8;
+shared float scores[64*32];
+shared bfloat16_t probabilities[64*32];
+shared float row_max[64],row_sum[64];
+
+void main(){
+ uint h=gl_WorkGroupID.x,tile=VERIFY?0:gl_WorkGroupID.y;
+ uint split=VERIFY?gl_WorkGroupID.y:gl_WorkGroupID.z,batch=VERIFY?gl_WorkGroupID.z:0;
+ RU32 p=RU32(binding_address(VERIFY?7:4)+uint64_t(batch)*(VERIFY?24:0));
+ uint committed=p.values[0],rows=VERIFY?8:p.values[1],stride=VERIFY?32:p.values[2];
+ uint ep=p.values[VERIFY?2:4],offset=p.values[VERIFY?3:5];
+ uint splits=p.values[VERIFY?4:6],slots=VERIFY?p.values[5]:splits;
+ if(split>=splits)return;
+ uint active_rows=min(8,rows-tile*8),base_committed=committed+tile*8;
+ uint pages=(base_committed+active_rows+31)/32,per=(pages+splits-1)/splits;
+ uint begin=split*per;
+ if(begin>=pages)return;
+ uint lane=gl_SubgroupInvocationID,sg=gl_SubgroupID,tid=gl_LocalInvocationIndex;
+ uint64_t slot=VERIFY?(uint64_t(batch)*KH+h)*slots+split:(uint64_t(tile)*KH+h)*splits+split;
+ uint64_t table=binding_address(3+batch);
+ uint query_base=((batch*KH+h)*stride+tile*8)*GROUP*256;
+ if(per!=1)return;
+ {uint page=begin;
+
+  uint mblock=sg/2,nblock=sg%2;
+  if(mblock<M/16){
+   MC score=MC(0.0);
+   uint64_t keys=page_address(table,page*32,h,0,ep,offset,false);
+   [[dont_unroll]] for(uint k=0;k<256;k+=16){
+    MA a;MB b;
+    coopMatLoad(a,RB16(binding_address(0)).values,query_base+mblock*16*256+k,256,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b,RB16(keys).values,nblock*16*256+k,256,gl_CooperativeMatrixLayoutColumnMajor);
+    score=coopMatMulAdd(a,b,score);
+   }
+   coopMatStore(score,scores,mblock*16*32+nblock*16,32,gl_CooperativeMatrixLayoutRowMajor);
+  }
+  barrier();
+  if(tid<4*M){
+   uint row=tid/4,column=(tid%4)*8;
+   uint limit=base_committed+min(row/GROUP,active_rows-1)+1;
+   float s[8],prob[8],maximum=-1.0/0.0;
+   [[unroll]]for(uint j=0;j<8;++j){
+    s[j]=page*32+column+j<limit?scores[row*32+column+j]*0.0625:-1.0/0.0;
+    maximum=max(maximum,s[j]);
+   }
+   maximum=max(maximum,subgroupShuffleXor(maximum,1));
+   maximum=max(maximum,subgroupShuffleXor(maximum,2));
+   float next_max=maximum;
+   precise float local_sum=0.0;
+   [[unroll]]for(uint j=0;j<8;++j){
+    prob[j]=page*32+column+j<limit?exp(s[j]-next_max):0.0;
+    local_sum+=prob[j];
+   }
+   local_sum+=subgroupShuffleXor(local_sum,1);
+   local_sum+=subgroupShuffleXor(local_sum,2);
+   if(column==0){
+    row_sum[row]=local_sum;row_max[row]=next_max;
+
+   }
+   [[unroll]]for(uint j=0;j<8;++j)
+    probabilities[row*32+column+j]=uintBitsToBFloat16EXT(float_bf16(prob[j]));
+  }
+  barrier();
+  uint64_t values=page_address(table,page*32,h,0,ep,offset,true);
+  [[unroll]]for(uint f=0;f<FRAGMENTS;++f){
+   uint mb=f/2,nb=(f%2)*8+sg;
+   MC output_tile=MC(0.0);
+   [[unroll]]for(uint k=0;k<32;k+=16){
+    MA a;MB b;
+    coopMatLoad(a,probabilities,mb*16*32+k,32,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b,RB16(values).values,nb*16*32+k,32,gl_CooperativeMatrixLayoutColumnMajor);
+    output_tile=coopMatMulAdd(a,b,output_tile);
+   }
+   [[unroll]]for(uint i=0;i<8;++i){
+    uint row=(lane&6)|((lane>>1)&8)|(i>>2),column=((lane&1)<<2)+(lane&8)+(i&3);
+    WF32(binding_address(1)+4*((slot*M+mb*16+row)*256+nb*16+column)).values[0]=output_tile[i];
+   }
+  }
+  barrier();
+ }
+
+ if(tid<M){WF32(binding_address(2)+8*(slot*M+tid)).values[0]=row_max[tid];WF32(binding_address(2)+8*(slot*M+tid)+4).values[0]=row_sum[tid];}
+}

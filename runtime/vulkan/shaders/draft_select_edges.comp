@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "draft_common.glsl"
+
+shared uint successors[16],predecessors[16];
+void merge_top(uint row,bool previous){float vals[16];uint ids[16];for(uint k=0;k<16;++k){vals[k]=-1.0/0.0;ids[k]=0xffffffffu;}
+ for(uint at=0;at<128;++at){uint idx=row*128+at,id=RU32(binding_address(0)).values[idx];float v=RF32(binding_address(1)).values[idx];if(v>vals[15]||(v==vals[15]&&id<ids[15])){uint k=15;while(k>0&&(v>vals[k-1]||(v==vals[k-1]&&id<ids[k-1]))){vals[k]=vals[k-1];ids[k]=ids[k-1];--k;}vals[k]=v;ids[k]=id;}}
+ for(uint k=0;k<16;++k){if(previous)predecessors[k]=ids[k];else{successors[k]=ids[k];WU32(binding_address(2)).values[row*16+k]=ids[k];WF32(binding_address(3)).values[row*16+k]=vals[k];}}
+}
+void main(){uint row=gl_WorkGroupID.x,batch=row/7,pos=row%7,thread=gl_LocalInvocationIndex,lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;RU32 p=RU32(binding_address(7));uint lanes=p.values[8],vocab=p.values[10];
+ if(thread==0){merge_top(row,false);if(pos>0)merge_top(row-1,true);else for(uint k=0;k<16;++k)predecessors[k]=p.values[batch];}barrier();
+ uint edges=pos>0?256:16;
+ for(uint edge=sg;edge<edges;edge+=8){uint pred=edge/16,succ=edge%16,pi=min(predecessors[pred],vocab-1),si=min(successors[succ],vocab-1);float score=0;
+ for(uint i=0;i<8;++i){uint dim=lane+32*i;score+=(rb(binding_address(5),pi*256+dim)*rb(binding_address(4),(batch*8+pos+1)*256+dim))*rb(binding_address(6),si*256+dim);}
+ score=subgroupAdd(score);if(lane==0)WF32(binding_address(1)).values[lanes*7*128+row*256+edge]=score;
+ }
+}

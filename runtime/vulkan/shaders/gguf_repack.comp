@@ -1,0 +1,123 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(constant_id = 3) const uint FORMAT = 0xffffffffu;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Params {
+    uint rows;
+    uint input_size;
+    uint fmt;
+    uint src_row_bytes;
+    uint dst_plane1;
+    uint dst_meta;
+};
+
+bool affine(uint f) { return f >= 19 && f <= 36; }
+uint affine_bits(uint f) {
+    const uint widths[6] = uint[6](2, 3, 4, 5, 6, 8);
+    return widths[(f - 19) / 3];
+}
+uvec4 fields(uint f) {
+    if (affine(f)) {
+        uint bits = affine_bits(f), group = 32u << ((f - 19) % 3);
+        uint low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
+        return uvec4(4 + group * bits / 8, 4 * low, 4 * (bits - low), 4);
+    }
+    if (f == 0) return uvec4(144, 16, 0, 16);
+    if (f == 1) return uvec4(136, 16, 0, 8);
+    if (f == 2) return uvec4(18, 16, 0, 2);
+    if (f == 3) return uvec4(176, 16, 4, 16);
+    if (f == 4) return uvec4(210, 16, 8, 20);
+    if (f == 6) return uvec4(34, 32, 0, 2);
+    return uvec4(512, 64, 0, 4);
+}
+uint meta_groups(uint f) {
+    if (affine(f)) return 1u << ((f - 19) % 3);
+    return f == 2 || f == 6 ? 1 : 8;
+}
+uint64_t tile_index(uint row, uint group, uint groups) {
+    return (uint64_t(row / 256) * groups + group) * 256 + row % 256;
+}
+uint byte_at(uint64_t base, uint index) {
+    uint word = uint(R16(base + (index & ~1u)).values[0]);
+    return (word >> (8 * (index & 1))) & 255;
+}
+uint element_of_slot(uint slot) {
+    uint chunk = slot / 8, pair = (slot / 2) % 4;
+    return 4 * chunk + 16 * (pair / 2) + 2 * (pair % 2) + slot % 2;
+}
+uint code_at(uint f, uint64_t base, uint j, uint e) {
+    if (affine(f)) {
+        uint bits = affine_bits(f), at = (32 * j + e) * bits;
+        uint word = byte_at(base, 4 + at / 8);
+        if (at % 8 + bits > 8) word |= byte_at(base, 5 + at / 8) << 8;
+        return (word >> (at % 8)) & ((1u << bits) - 1);
+    }
+    if (f == 0 || f == 3) {
+        uint lo = (byte_at(base, (f == 0 ? 16 : 48) + (j / 2) * 32 + e) >> (4 * (j % 2))) & 15;
+        return f == 3 ? lo | (((byte_at(base, 16 + e) >> j) & 1) << 4) : lo;
+    }
+    if (f == 1 || f == 2) {
+        uint q = byte_at(base, (f == 1 ? 8 + 16 * j : 2) + e % 16);
+        return (q >> (4 * (e / 16))) & 15;
+    }
+    if (f == 4) {
+        uint quarter = j % 4, hb = j / 4;
+        uint lo = (byte_at(base, 64 * hb + 32 * (quarter & 1) + e) >> (4 * (quarter >> 1))) & 15;
+        uint hi = (byte_at(base, 128 + 32 * hb + e) >> (2 * quarter)) & 3;
+        return lo | (hi << 4);
+    }
+    if (f == 6) return byte_at(base, 2 + e);
+    return uint(R16(base + 2 * (32 * j + e)).values[0]);
+}
+
+void main() {
+    Params p = Params(binding_address(2));
+    uint f = FORMAT == 0xffffffffu ? p.fmt : FORMAT;
+    uint G = p.input_size / 32;
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= p.rows * G) return;
+    uint row = t / G, g = t % G;
+    uvec4 format = fields(f);
+    uint mg = meta_groups(f), block = g / mg, j = g % mg;
+    uint64_t source = binding_address(0) + uint64_t(row) * p.src_row_bytes + uint64_t(block) * format.x;
+    uint64_t output0 = binding_address(1) + tile_index(row, g, G) * format.y;
+    uint64_t output1 = binding_address(1) + p.dst_plane1 + tile_index(row, g, G) * format.z;
+    uint64_t meta = binding_address(1) + p.dst_meta + tile_index(row, block, G / mg) * format.w;
+    uint low_bits = format.y / 4;
+    bool pairs = f == 0 || f == 3 || f == 4 || (affine(f) && low_bits == 4);
+    for (uint word = 0; word < format.y / 4; ++word) {
+        uint packed = 0;
+        if (pairs) {
+            [[unroll]] for (uint pair = 0; pair < 4; ++pair) {
+                uint e = 4 * word + 16 * (pair / 2) + 2 * (pair % 2);
+                packed |= (code_at(f, source, j, e) & 15) << (4 * pair);
+                packed |= (code_at(f, source, j, e + 1) & 15) << (16 + 4 * pair);
+            }
+        } else {
+            uint per_word = 32 / low_bits;
+            for (uint slot = 0; slot < per_word; ++slot)
+                packed |= (code_at(f, source, j, element_of_slot(word * per_word + slot)) & ((1u << low_bits) - 1)) << (slot * low_bits);
+        }
+        WU32(output0 + 4 * word).values[0] = packed;
+    }
+    uint high_bits = format.z / 4;
+    for (uint word = 0; word < high_bits; ++word) {
+        uint packed = 0, per_word = 32 / high_bits;
+        for (uint slot = 0; slot < per_word; ++slot)
+            packed |= ((code_at(f, source, j, element_of_slot(word * per_word + slot)) >> low_bits) & ((1u << high_bits) - 1)) << (slot * high_bits);
+        WU32(output1 + 4 * word).values[0] = packed;
+    }
+    if (j != 0) return;
+    if (f == 4) {
+        [[unroll]] for (uint i = 0; i < 8; ++i)
+            W16(meta + 2 * i).values[0] = R16(source + 192 + 2 * i).values[0];
+        W16(meta + 16).values[0] = R16(source + 208).values[0];
+        W16(meta + 18).values[0] = uint16_t(0);
+    } else if (f == 41 || f == 42) {
+        WU32(meta).values[0] = 0x3f800000u;
+    } else {
+        for (uint i = 0; i < format.w / 2; ++i)
+            W16(meta + 2 * i).values[0] = R16(source + 2 * i).values[0];
+    }
+}

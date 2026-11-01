@@ -1,0 +1,7 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#define SPLASH_LOCAL_SIZE_DEFAULT 256
+#include "common.glsl"
+layout(buffer_reference,std430,buffer_reference_align=4)readonly buffer Params {uint count;};
+layout(buffer_reference,std430,buffer_reference_align=4)writeonly buffer Vectors {uvec4 values[];};
+void main(){uint i=(gl_WorkGroupID.x+gl_NumWorkGroups.x*gl_WorkGroupID.y)*256+gl_LocalInvocationIndex;if(i<Params(binding_address(2)).count)Vectors(binding_address(1)).values[i]=RU32x4(binding_address(0)).values[i];}
